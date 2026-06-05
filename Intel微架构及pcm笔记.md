@@ -1812,20 +1812,244 @@ LBR 是记录最近分支的循环缓冲区：
 - 可按分支类型过滤
 - 可包含在 PEBS 记录中
 
-### 5.6 Uncore PMU
+### 5.6 Core / Offcore / Uncore — 三个概念的区分
 
-Core PMU 之外，Intel 还提供 Uncore PMU 用于系统级监控：
+理解 Intel PMU 必须先区分 **Core、Offcore、Uncore** 这三个概念，它们经常被混用：
 
-| 监控单元 | 监控内容 | 访问方式 |
-|---------|---------|---------|
-| **CHA/CBox** | L3 缓存切片活动, 一致性事务 | PCI Config / MMIO |
-| **IMC** | DRAM 读写带宽, 通道利用率 | PCI Config / MMIO |
-| **UPI/QPI** | Socket 间链路带宽和利用率 | PCI Config |
-| **IIO** | PCIe I/O 流量 | PCI Config / MMIO |
-| **PCU** | 频率, 热管理, C-state 转换 | MSR |
-| **M2M** | Mesh 到内存接口 | PCI Config |
+```
+        Core (核心内)              Uncore (核心外)
+        ┌──────────┐              ┌─────────────────┐
+        │ Frontend │              │  L3/CHA         │
+        │ Backend  │   Offcore    │  Mesh           │
+        │ L1/L2    │ ◄═════════►  │  iMC (内存)     │
+        └──────────┘   边界穿越    │  UPI            │
+                                  │  IIO/PCIe       │
+                                  └─────────────────┘
+```
 
-### 5.7 PCM 如何访问 PMU 硬件
+| 维度 | Core | Offcore | Uncore |
+|------|------|---------|--------|
+| **是什么** | 核心内部 | "穿越核心边界"的事件分类 | 核心外的共享子系统 |
+| **物理位置** | 核心 die 区域 | 边界 (无独立单元) | mesh + L3 + iMC + UPI 等 |
+| **PMU 计数器** | Core PMU (每核 4-8 个 GP) | 用 Core PMU + 配置 OCR MSR | Uncore PMU (CHA/iMC/UPI 各有计数器) |
+| **典型事件** | INST_RETIRED, BR_MISP_RETIRED | OFFCORE_RESPONSE.* | UNC_M_CAS_COUNT, UNC_CHA_LLC_LOOKUP |
+| **PCM 工具** | `pcm`, `pcm-core` | `pcm-raw` (需配置 OCR MSR) | `pcm-memory`, `pcm-iio`, `pcm-raw` |
+
+**Offcore 详解 — 监控 L2 miss 后的请求去向：**
+
+`OFFCORE_RESPONSE` 事件 (event 0xB7/0xBB) 通过 `MSR_OFFCORE_RSP_0` (0x1A6) 和 `MSR_OFFCORE_RSP_1` (0x1A7) 配置，可同时筛选两个维度：
+
+**维度1: 请求类型 (低位掩码)**
+
+| 类型 | 含义 |
+|------|------|
+| DEMAND_DATA_RD | 需求数据加载 |
+| DEMAND_RFO | 需求写 (Read-for-Ownership) |
+| DEMAND_CODE_RD | 需求代码取指 |
+| PF_L2_DATA_RD | L2 预取的数据加载 |
+| PF_L3_DATA_RD | L3 预取的数据加载 |
+| WRITEBACK | 缓存写回 |
+
+**维度2: 响应类型 (高位掩码) — 数据来源**
+
+| 来源 | 含义 |
+|------|------|
+| L3_HIT_E/M/S | L3 命中 (E/M/S 状态) |
+| L3_HIT_HITM_OTHER_CORE | 命中其他核心的修改数据 (假共享指标!) |
+| L3_MISS_LOCAL_DRAM | 本地 DRAM |
+| L3_MISS_REMOTE_DRAM | 远端 Socket DRAM (NUMA 指标) |
+| L3_MISS_REMOTE_HITM | 远端 Socket 其他核心的修改数据 |
+
+**OCR 事件示例：**
+
+```bash
+# 检测远端 DRAM 访问 (NUMA 不均衡)
+sudo pcm-raw -e cpu/event=0xb7,umask=0x01,offcore_rsp=0x3F803C0001,name=DEMAND_RD_REMOTE_DRAM/
+
+# 检测假共享 (HITM 来自其他核心)
+sudo pcm-raw -e cpu/event=0xb7,umask=0x01,offcore_rsp=0x10003C0001,name=DEMAND_RD_HITM/
+```
+
+**简单记忆：** Offcore 是从 Core 视角看 L2 miss 之后发生的事；Uncore 是从硬件视角看那些不在 Core 内的部件。OCR 事件是 Core PMU 提供的"窥视 Uncore 边界"的能力。
+
+### 5.7 Uncore PMU 详解 — 各种 Box 解析
+
+Uncore 内部由多个子单元组成，每个被称为一个 **Box**。每个 Box 有自己独立的 PMU 计数器，通过 `pcm-raw` 监控时需指定对应的 Box 类型。
+
+#### 5.7.1 Uncore Box 总览图 (Skylake-SP+ Mesh 架构)
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                         Mesh Interconnect                             │
+│                                                                       │
+│  ┌──────┐      ┌──────┐      ┌──────┐      ┌──────┐      ┌──────┐  │
+│  │ CHA0 │◄────►│ CHA1 │◄────►│ CHA2 │◄────►│ ...  │◄────►│ CHAn │  │
+│  │+L3切片│      │+L3切片│      │+L3切片│      │      │      │+L3切片│  │
+│  └──┬───┘      └──┬───┘      └──┬───┘      └──┬───┘      └──┬───┘  │
+│     │             │             │             │             │       │
+│  ┌──┴────┐    ┌───┴───┐     ┌──┴────┐    ┌───┴───┐     ┌──┴────┐  │
+│  │ Core  │    │ Core  │     │ Core  │    │ Core  │     │ Core  │  │
+│  │+L1/L2 │    │+L1/L2 │     │+L1/L2 │    │+L1/L2 │     │+L1/L2 │  │
+│  └───────┘    └───────┘     └───────┘    └───────┘     └───────┘  │
+│                                                                       │
+│  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐       │
+│  │ M2M  │  │ M2M  │  │M3UPI │  │ IIO  │  │ PCU  │  │ UBox │       │
+│  └──┬───┘  └──┬───┘  └──┬───┘  └──┬───┘  └──┬───┘  └──┬───┘       │
+│     │        │         │         │         │         │             │
+└─────┼────────┼─────────┼─────────┼─────────┼─────────┼─────────────┘
+      ▼        ▼         ▼         ▼         ▼         ▼
+   ┌────┐  ┌────┐    ┌─────┐   ┌─────┐  ┌────┐    ┌────┐
+   │iMC0│  │iMC1│    │ UPI │   │PCIe │  │电源│    │管理│
+   │DRAM│  │DRAM│    │ Link│   │ Root│  │管理│    │/配置│
+   └────┘  └────┘    └─────┘   └─────┘  └────┘    └────┘
+```
+
+#### 5.7.2 各 Box 详解
+
+**CBox / CHA — Caching (and Home) Agent**
+
+| 代次 | 名称 | 功能 |
+|------|------|------|
+| Sandy Bridge ~ Broadwell | **CBox / CBo** | L3 切片 + 缓存一致性代理 |
+| Skylake-SP 之后 | **CHA** | L3 切片 + Caching Agent + Home Agent (合并) |
+
+- 管理一个 L3 切片 (~1.5-3 MB)
+- 处理本切片地址范围的缓存一致性事务
+- 维护 Snoop Filter / Directory
+- Mesh Stop (核心和其他 Box 接入 Mesh 的位置)
+- 数量 ≈ 核心数
+
+**UBox — Uncore Box (Uncore 管理中心)**
+
+每个 Socket 一个，是 Uncore 的"控制大脑"：
+- Uncore 全局事件管理 (PMON 全局控制)
+- 系统级配置寄存器
+- 中断处理 (LAPIC 之外的部分)
+- 错误日志和报告 (MCA)
+- 跨 Box 协调
+
+**iMC / MBox — 集成内存控制器**
+
+- DRAM 命令调度 (ACTIVATE, READ, WRITE, PRECHARGE, REFRESH)
+- 地址解码、ECC、刷新管理
+- 一个 iMC 通常控制 2-3 个 DDR 通道
+- `pcm-memory` 主要数据来源
+
+**M2M — Mesh-to-Memory 桥**
+
+Mesh 互联和 iMC 之间的桥接器 (Skylake-SP 之后)：
+- 把 Mesh 协议转换为 DDR 控制器接口
+- 一致性事务的最终处理点
+- 数量通常 = iMC 数量
+
+**M3UPI / R3QPI — Mesh-to-UPI 桥**
+
+| 代次 | 名称 |
+|------|------|
+| Sandy Bridge ~ Broadwell | **R3QPI** (Ring-to-3-QPI) |
+| Skylake-SP 之后 | **M3UPI** (Mesh-to-3-UPI) |
+
+- Mesh 协议 ↔ UPI/QPI 协议转换
+- 跨 Socket 一致性流量的入口/出口
+- 每条 UPI 链路有对应的 M3UPI 实例
+
+**UPI / QPI Link — 跨 Socket 互联**
+
+| 代次 | 名称 |
+|------|------|
+| Nehalem ~ Broadwell | **QPI** (QuickPath Interconnect) |
+| Skylake-SP 之后 | **UPI** (Ultra Path Interconnect) |
+
+- 物理层 + 链路层
+- 跨 Socket 缓存一致性
+- 每 UPI 链路有独立 PMU 计数器
+
+**IIO Stack — I/O 接口盒 (PCIe 子系统总称)**
+
+IIO 是一个**伞形概念**，包含多个并列子单元：
+
+```
+┌───────────────────────────────────────────────────────────┐
+│                     IIO Stack                              │
+│  ┌──────────────┐   ┌──────────┐   ┌─────────┐          │
+│  │ PCIe Root    │   │   IRP    │   │ M2PCIe  │          │
+│  │  Port        │   │  (I/O    │   │ (协议   │          │
+│  │ (链路层/      │   │  一致性  │   │  转换桥) │          │
+│  │  事务层)      │   │  代理)   │   │         │          │
+│  └──────────────┘   └──────────┘   └─────────┘          │
+└────────────────────────┬───────────────────────────────────┘
+                         ▼
+                    Mesh 互联
+```
+
+- **PCIe Root Port:** 处理 PCIe 链路层、流控、TLP 解析 (`UNC_IIO_*` 事件)
+- **IRP (I/O Ring Pendant):** I/O 一致性代理，代表 PCIe 设备在 Mesh 上充当 Caching Agent (`UNC_I_*` 事件)
+- **M2PCIe:** Mesh ↔ PCIe 协议桥，处理 flit 封装/拆解、信用流控 (`UNC_M2P_*` 事件)
+
+**入站 DMA 数据流向 (PCIe Device → DRAM):**
+
+```
+PCIe Device → PCIe Root Port → IRP (一致性代理) → M2PCIe (协议封装)
+            → Mesh → CHA → iMC → DRAM
+```
+
+**出站 MMIO 数据流向 (CPU → PCIe Device):**
+
+```
+Core → Mesh → M2PCIe → IIO/Root Port → PCIe Device
+```
+
+**PCU / PBox — 电源控制单元**
+
+每个 Socket 一个，是 Uncore 的"小 CPU"：
+- 频率调节 (P-state 转换)
+- C-state 管理
+- 热保护和节流
+- 功率限制 (RAPL)
+- Turbo Boost 决策
+- Uncore 频率独立调节
+- 内部运行专用 microcontroller
+
+**HBox / HA (Home Agent) — 旧架构**
+
+仅存在于 Broadwell 及更早，Skylake-SP 后已合并到 CHA。
+
+#### 5.7.3 不同代次的 Box 命名对照表
+
+| 功能 | Nehalem-Westmere | SNB-BDW (环) | SKX-EMR (Mesh) | GNR (Xeon 6) |
+|------|-----------------|-------------|----------------|--------------|
+| LLC 切片 + 一致性 | CBox + HBox | CBox + HBox | **CHA** | **CHA** |
+| 内存控制器 | MBox/iMC | iMC | iMC | iMC |
+| Mesh-to-Memory 桥 | — | — | **M2M** | **M2M** |
+| QPI/UPI 桥 | SBox/RBox | R3QPI | **M3UPI** | **M3UPI** |
+| I/O 接口 | — | IIO | IIO | IIO |
+| I/O 一致性 | — | IRP | IRP | IRP |
+| 电源控制 | PCU | PCU | PCU | PCU |
+| Uncore 管理 | UBox | UBox | UBox | UBox |
+
+#### 5.7.4 PCM 工具与 Box 的对应关系
+
+| PCM 工具 | 主要监控的 Box |
+|---------|---------------|
+| `pcm-memory` | iMC + M2M |
+| `pcm-pcie` | IIO + IRP |
+| `pcm-iio` | IIO (逐端口) + IOMMU |
+| `pcm-numa` | CHA + UPI |
+| `pcm-power` | PCU |
+| `pcm-latency` | iMC RPQ 计数器 |
+| `pcm-raw` | **所有 Box** (最灵活) |
+
+#### 5.7.5 快速记忆
+
+```
+处理"核内→核外"边界:    CHA (CBox + HA)
+处理"Mesh→外设":         M2M (内存) / M3UPI (UPI) / M2PCIe (PCIe)
+对外接口:                iMC (DRAM) / UPI (Socket) / IIO (PCIe)
+管理:                    UBox (Uncore 管理) / PCU (功耗管理)
+I/O 一致性:              IRP
+```
+
+### 5.8 PCM 如何访问 PMU 硬件
 
 | 访问方式 | 说明 | 使用场景 |
 |---------|------|---------|
@@ -2518,6 +2742,139 @@ echo 2400000 | sudo tee /sys/devices/system/cpu/intel_uncore_frequency/package_0
 #   受 Package Power Budget 约束 → 与核心频率竞争功率预算
 ```
 
+### 13.5 如何判断 Core / Uncore 是否降频
+
+`pcm-power` 输出示例：
+```
+S0; Uncore Freq: 2.20 GHz
+Core Freq: 3.50 GHz
+Core Power License 0: 99.98%
+Core Power License 1: 0.02%
+Core Power License 2: 0.00%
+```
+
+判断降频本质上就是 **"当前值 < 应有最大值"**，关键是要根据负载特性选对参考上限。
+
+#### 13.5.1 Core Power License — AVX 频率档位
+
+`Core Power License` 反映 CPU 当前运行的 **AVX 频率档位**，每个档位有不同的频率上限：
+
+| License | 含义 | 频率影响 |
+|---------|------|---------|
+| **License 0** | 非 AVX 或轻量级标量代码 | **最高频率** (允许 base + 全 turbo) |
+| **License 1** | AVX2 (256-bit) 重负载 | **中等频率** (有 AVX2 offset, 通常 -200~400 MHz) |
+| **License 2** | AVX-512 重负载 | **最低频率** (有 AVX-512 offset, 通常 -400~800 MHz) |
+
+判断 Core 降频时，要根据 License 占比选对应的 Turbo 上限作为参考：
+- License 0 主导 → 用非 AVX Turbo 上限
+- License 1 主导 → 用 AVX2 Turbo 上限
+- License 2 主导 → 用 AVX-512 Turbo 上限
+
+#### 13.5.2 Core 频率参考值获取
+
+```bash
+# 基础频率和 Turbo 频率
+lscpu | grep -i mhz
+cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq    # 最大 Turbo 频率
+cat /sys/devices/system/cpu/cpu0/cpufreq/base_frequency       # 基础频率
+
+# Turbo Boost 各档位 (按活跃核数)
+sudo rdmsr 0x1AD                # MSR_TURBO_RATIO_LIMIT
+# 每个字节代表 N 核活跃时的最大 Turbo 倍频
+```
+
+#### 13.5.3 Uncore 频率参考值获取
+
+```bash
+# 方法1: 读 MSR_UNCORE_RATIO_LIMIT (0x620)
+sudo rdmsr 0x620
+# 解读:
+#   Bits [6:0]   = MAX_RATIO  (最大倍频 × 100MHz = 最大频率)
+#   Bits [14:8]  = MIN_RATIO  (最小倍频 × 100MHz = 最小频率)
+
+# 方法2: sysfs
+cat /sys/devices/system/cpu/intel_uncore_frequency/package_00_die_00/initial_max_freq_khz
+cat /sys/devices/system/cpu/intel_uncore_frequency/package_00_die_00/initial_min_freq_khz
+```
+
+**示例：** 假设读出 MSR 0x620 = 0x0824 → MAX_RATIO=0x24=36 → 最大 3.6 GHz。当前 Uncore Freq = 2.20 GHz，则 2.20 < 3.60 → **Uncore 存在降频** (~61%)。
+
+#### 13.5.4 综合判断流程
+
+```
+判断 Uncore 是否降频:
+  1. 读 MSR 0x620 → 得 MAX_RATIO
+  2. 当前 Uncore Freq < MAX_RATIO × 100MHz?
+     ├─ 是 → 降频了 → 查降频原因
+     └─ 否 → 满频运行
+
+判断 Core 是否降频:
+  1. 看 Core Power License 分布 (确定应使用哪个频率上限)
+     ├─ License 0 主导 → 用非 AVX Turbo 上限
+     ├─ License 1 主导 → 用 AVX2 Turbo 上限
+     └─ License 2 主导 → 用 AVX-512 Turbo 上限
+  2. 当前 Core Freq < 对应 Turbo 上限 (按活跃核数)?
+     ├─ 是 → 降频了
+     └─ 否 → 满频运行
+```
+
+#### 13.5.5 降频原因排查
+
+```bash
+# 1. 全面检查节流原因 - turbostat
+sudo turbostat --show Package,Core,Bzy_MHz,UncMHz,PkgWatt,CoreTmp,CorWatt sleep 5
+
+# 关注:
+#   PkgWatt > TDP?     → 功率节流
+#   CoreTmp > 90°C?    → 热节流
+#   UncMHz 远低于最大? → Uncore 主动降频 (省功耗)
+
+# 2. 查节流原因 MSR
+sudo rdmsr 0x1B1   # IA32_PACKAGE_THERM_STATUS
+sudo rdmsr 0x19C   # IA32_THERM_STATUS
+# Bit 0  = Thermal Status (是否触发温度限制)
+# Bit 10 = PROCHOT
+# Bit 12 = Power Limitation
+# Bit 14 = Current Limit
+
+# 3. 查功率限制配置 (RAPL)
+sudo rdmsr 0x610   # MSR_PKG_POWER_LIMIT
+# 解读 PL1 (长期功率限制) 和 PL2 (短期功率限制)
+
+# 4. C-state 残留 (核心是否在睡眠中)
+sudo turbostat --show CPU%c1,CPU%c6,Pkg%pc6 sleep 5
+# 高 c6/pc6 = 核心频繁深度睡眠 → 唤醒延迟导致有效频率下降
+
+# 5. 查所有核心实时频率分布
+sudo turbostat --interval 1 --show CPU,Bzy_MHz
+# 看是否有些核心降频而其他核心没有
+```
+
+#### 13.5.6 一键诊断脚本
+
+```bash
+#!/bin/bash
+echo "=== Uncore 频率分析 ==="
+UNCORE_LIMIT=$(sudo rdmsr 0x620)
+MAX_RATIO=$((0x$UNCORE_LIMIT & 0x7F))
+MIN_RATIO=$(((0x$UNCORE_LIMIT >> 8) & 0x7F))
+CUR_UNCORE=$(sudo rdmsr 0x621)
+CUR_RATIO=$((0x$CUR_UNCORE & 0x7F))
+echo "Uncore: 当前=$((CUR_RATIO * 100))MHz 最大=$((MAX_RATIO * 100))MHz 最小=$((MIN_RATIO * 100))MHz"
+[ $CUR_RATIO -lt $MAX_RATIO ] && echo "  → Uncore 降频中 ($(( CUR_RATIO * 100 / MAX_RATIO ))% of max)"
+
+echo ""
+echo "=== Core 节流原因 ==="
+THERM=$(sudo rdmsr -p 0 0x19C)
+echo "THERM_STATUS = 0x$THERM"
+[ $((0x$THERM & 0x1)) -ne 0 ] && echo "  ⚠ 热节流触发过"
+[ $((0x$THERM & 0x400)) -ne 0 ] && echo "  ⚠ PROCHOT 触发"
+[ $((0x$THERM & 0x1000)) -ne 0 ] && echo "  ⚠ 功率限制触发"
+[ $((0x$THERM & 0x4000)) -ne 0 ] && echo "  ⚠ 电流限制触发"
+```
+
+> **核心提示：** `pcm-power` 自身不直接告诉你"是否降频"，需要你做对比。Uncore 中等档位频率 (如 2.2 GHz) 在非满负载时通常是 PCU 主动节能调节的结果，对延迟敏感型负载可考虑锁定到最大频率。
+
 ---
 
 ## 第14章 pcm-core / pcm-raw — 自定义事件监控
@@ -2666,6 +3023,169 @@ Uncore 事件在单独文档中：**Intel Xeon Processor Scalable Family Uncore 
   └─ 需要 Uncore 事件 → 搜索 Intel Uncore Performance Monitoring
                          Reference Manual (每代一份独立文档)
 ```
+
+### 14.4 Uncore 事件命名解码示例
+
+Intel Uncore 事件名遵循固定的命名规则，掌握命名约定有助于快速理解事件含义。
+
+#### 14.4.1 通用命名模式
+
+```
+UNC_<BOX>_<功能>_<细化>_<方向>_<后缀>
+│   │     │     │     │      │
+│   │     │     │     │      └─ _0/_1: 子计数器/通道索引
+│   │     │     │     └──────── 方向: TxR(发送) / RxR(接收)
+│   │     │     └────────────── 细化: P2P, LOCAL, REMOTE 等
+│   │     └──────────────────── 功能: LOOKUP, INSERTS, OCCUPANCY 等
+│   └────────────────────────── BOX 类型: M (iMC), CHA, M2P, I (IRP) 等
+└────────────────────────────── UNC_: Uncore 事件前缀
+```
+
+#### 14.4.2 BOX 缩写对照
+
+| 前缀 | Box | 示例事件 |
+|------|-----|---------|
+| `UNC_M_` | iMC (内存控制器) | `UNC_M_CAS_COUNT.RD` |
+| `UNC_M2M_` | M2M (Mesh-to-Memory) | `UNC_M2M_DIRECTORY_HIT` |
+| `UNC_CHA_` | CHA (Caching/Home Agent) | `UNC_CHA_LLC_LOOKUP.DATA_READ` |
+| `UNC_M2P_` | M2PCIe (Mesh-to-PCIe) | `UNC_M2P_LOCAL_P2P_DED_RETURNED_1` |
+| `UNC_I_` | IRP (I/O Ring Pendant) | `UNC_I_TxR2_AD0_STALL_CREDIT_CYCLES` |
+| `UNC_IIO_` | IIO Stack (PCIe Root) | `UNC_IIO_DATA_REQ_OF_CPU` |
+| `UNC_M3UPI_` | M3UPI (Mesh-to-UPI) | `UNC_M3UPI_TxL_FLITS` |
+| `UNC_UPI_` | UPI Link | `UNC_UPI_DATA_FLITS` |
+| `UNC_PCU_` | PCU (功耗控制) | `UNC_PCU_FREQ_TRANS_CYCLES` |
+| `UNC_U_` | UBox | `UNC_U_EVENT_MSG` |
+
+#### 14.4.3 Mesh 虚拟通道 (VC) — 理解 AD/AK/BL/IV
+
+Intel Mesh/Ring 互联使用多个虚拟通道隔离不同流量类型，避免协议死锁：
+
+| 通道 | 全称 | 用途 |
+|------|------|------|
+| **AD** | Address / Snoop | 请求、地址、Snoop 命令 |
+| **AK** | Acknowledge | 响应/确认 (无数据) |
+| **BL** | Block / Data | 携带数据的响应 (64B 数据块) |
+| **IV** | Invalidate | 失效消息 |
+
+每个 VC 可分子通道 (`AD0`, `AD1`)，区分流量优先级或类别。事件名中带 `AD0_*` 表示该事件追踪 AD 通道的子通道 0 上的流量。
+
+#### 14.4.4 信用流控 — STALL_CREDIT 类事件
+
+Mesh 互联使用**基于信用的流控**：发送方需要消耗信用才能发送 flit，接收方处理完后归还信用。信用耗尽时发送方停顿。
+
+```
+基于信用的流控 (类似 PCIe):
+  1. 接收方启动时通告 N 个缓冲区 = N 个信用
+  2. 发送方每发一 flit 扣 1 信用
+  3. 接收方处理完归还 1 信用
+  4. 信用 = 0 时发送方停顿 ← STALL_CREDIT 事件计数这个
+
+       Sender                  Receiver
+        │── flit 1 ──────────►│ credits--, buffer 占用
+        │── flit 2 ──────────►│
+        ...
+        │── flit N ──────────►│ credits=0, buffer 满
+        │   ✗ 想发新 flit      │
+        │   STALL ←─────       │ ← 计数停顿周期
+        │                      │
+        │◄── credit return ────│ 处理完归还信用
+        │── 恢复发送 ─────────►│
+```
+
+#### 14.4.5 实际事件解码示例
+
+**示例 1: `UNC_M2P_LOCAL_P2P_DED_RETURNED_1`**
+
+```
+UNC_M2P_LOCAL_P2P_DED_RETURNED_1
+│   │   │     │   │   │        │
+│   │   │     │   │   │        └─ _1: 子计数器/通道索引 (区分两个 mesh 接口)
+│   │   │     │   │   └────────── RETURNED: 已返回的事务 (响应方向)
+│   │   │     │   └────────────── DED: Dedicated (专用通道/资源)
+│   │   │     └────────────────── P2P: Peer-to-Peer (PCIe 设备间直接通信)
+│   │   └──────────────────────── LOCAL: 同 Socket 内 (vs REMOTE 跨 Socket)
+│   └──────────────────────────── M2P: Mesh-to-PCIe 桥
+└──────────────────────────────── UNC_: Uncore 事件前缀
+
+含义: 通过 M2PCIe 第 1 个 Mesh 接口返回的、本地 P2P 专用通道完成事务数
+
+监控价值:
+  - 评估 GPU-to-GPU、NVMe-to-GPU 等 P2P 流量真实带宽
+  - 验证 GPUDirect/P2P 是否生效 (P2P 计数应远高于普通 DMA)
+  - 排查 ACS 配置导致的 P2P 失效 (启用 ACS 强制 P2P 上行到 RC)
+  - 区分本地 P2P vs 跨 Socket P2P (后者性能差很多)
+```
+
+**Peer-to-Peer (P2P) 流量示意：**
+
+```
+传统流量 (经过内存):
+  设备A → DMA 写到 RAM → 设备B 从 RAM 读取
+
+P2P 流量:
+  设备A → 直接 DMA 写到设备B 的 BAR → 设备B 接收
+  
+  (典型场景: GPU-to-GPU NVLink, NVMe-to-GPU GPUDirect Storage,
+            网卡-to-GPU GPUDirect RDMA)
+```
+
+**示例 2: `UNC_I_TxR2_AD0_STALL_CREDIT_CYCLES`** (Ice Lake)
+
+```
+UNC_I_TxR2_AD0_STALL_CREDIT_CYCLES
+│   │ │    │   │     │
+│   │ │    │   │     └─ CYCLES: 计数停顿周期数
+│   │ │    │   └─────── STALL_CREDIT: 因信用不足而停顿
+│   │ │    └─────────── AD0: AD 虚拟通道 0
+│   │ └──────────────── TxR2: Transmit Ring/Path 2 (发送路径 2)
+│   └────────────────── I: IRP (I/O Ring Pendant) Box
+└────────────────────── UNC_: Uncore 事件前缀
+
+含义: IRP 通过 TxR2 路径向 M2PCIe 发送 AD0 通道 (地址/请求) 流量时,
+      因 M2PCIe 侧 AD0 入口缓冲区已满 (信用耗尽) 而停顿的周期数。
+
+数据流向:
+  IRP ───► [信用阻塞] ───► M2PCIe ───► Mesh
+   ▲
+   │ 停顿在这里
+```
+
+**性能含义：** 这是负面指标，数值高表示存在 PCIe/IO 反压：
+
+| 值 | 含义 |
+|-----|------|
+| 接近 0 | 健康，无信用阻塞 |
+| 占比高 (>5% 总周期) | M2PCIe 处理能力跟不上 IRP 发送速率 |
+| 持续高位 | PCIe 子系统拥塞，下游设备消费太慢或路径有瓶颈 |
+
+**典型问题场景：**
+- PCIe 链路带宽不足 → 设备消费 TLP 速率低 → 缓冲堆积 → 信用耗尽
+- 多设备共享同一 IIO Stack 竞争
+- PCIe ACS 配置不合理，P2P 被强制上行 RC
+
+#### 14.4.6 配合相关事件做全景分析
+
+```bash
+# IRP 各通道的信用停顿
+sudo pcm-raw \
+  -e UNC_I_TxR2_AD0_STALL_CREDIT_CYCLES \
+  -e UNC_I_TxR2_AD1_STALL_CREDIT_CYCLES \
+  -e UNC_I_TxR2_BL_STALL_CREDIT_CYCLES \
+  -e UNC_I_TxR2_AK_STALL_CREDIT_CYCLES \
+  -e UNC_I_CLOCKTICKS
+
+# 计算停顿占比
+# Stall % = STALL_CREDIT_CYCLES / CLOCKTICKS × 100
+
+# P2P 流量分析
+sudo pcm-raw \
+  -e UNC_M2P_LOCAL_P2P_DED_RETURNED_0 \
+  -e UNC_M2P_LOCAL_P2P_DED_RETURNED_1 \
+  -e UNC_M2P_REMOTE_P2P_DED_RETURNED \
+  -e UNC_M2P_LOCAL_P2P_INSERTED
+```
+
+> **关键提示：** Intel Uncore 事件命名约定有细微的代次差异，`_1` 后缀的精确含义 (Mesh 接口/VC/周期) 在不同平台 (SPR vs EMR vs GNR) 可能略有不同。**最权威的来源是 Intel perfmon JSON 中该事件的 `BriefDescription` / `PublicDescription` 字段**。
 
 ---
 
@@ -3443,7 +3963,7 @@ PCM_PRINT_TOPOLOGY=1 sudo pcm 1 -i=1
 
 ---
 
-> **手册版本：** v2.0 (新增 Q&A 深度解析内容)
+> **手册版本：** v3.0 (新增 Uncore Box 详解、Offcore 概念、降频判断、Uncore 事件解码)
 > **最后更新：** 2026-06-04
 > **基于 PCM 版本：** 202604+
 > **参考资料：**
