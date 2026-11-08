@@ -14,6 +14,7 @@
     - [1.11 IPC 最大值分析](#111-ipc-最大值分析)
     - [1.12 退休宽度、流水线深度与执行端口的区别](#112-退休宽度流水线深度与执行端口的区别)
     - [1.13 超线程 (Hyper-Threading) 微架构资源划分](#113-超线程-hyper-threading-微架构资源划分)
+    - [1.14 流水线组件功能详解(对照微架构框图)](#114-流水线组件功能详解对照微架构框图)
   - [第2章 内存子系统架构](#第2章-内存子系统架构)
   - [第3章 PCIe 体系结构](#第3章-pcie-体系结构)
   - [第4章 IOMMU (Intel VT-d)](#第4章-iommu-intel-vt-d)
@@ -112,11 +113,11 @@ Intel 现代 x86 核心采用**深度流水线、超标量、乱序执行**设�
 
 x86 CISC 指令在执行前被解码为内部 **微操作 (uops)**：
 
-| 代次 | 解码器数量 | 说明 |
+| 代次 | 解码宽度 | 说明 |
 |------|-----------|------|
-| Skylake | 4 (1 复杂 + 3 简单) | 简单解码器：1 uop/指令；复杂解码器：≤4 uops/指令 |
-| Ice Lake | 5 (1 复杂 + 4 简单) | 解码宽度提升 25% |
-| Sapphire Rapids | 6 (1 复杂 + 5 简单) | 解码宽度提升 50% vs SKL |
+| Skylake | 4 (1 复杂 + 3 简单) | 简单解码器：1 uop/指令；复杂解码器：≤4 uops/指令；MITE 峰值 4 uops/周期 |
+| Ice Lake (Sunny Cove) | 4 (1 复杂 + 3 简单) | **解码宽度未变**；加宽到 5-wide 的是重命名/分配/退休级 (常见误传点，见 §1.14.5 审计注 1) |
+| Sapphire Rapids (Golden Cove) | 6 (含 1 个复杂解码器) | 解码宽度 +50% vs SKL，重命名/分配同为 6-wide |
 
 - 超过 4 uops 的复杂指令 (如 REP MOVS, CPUID) 由**微码序列器 (MSROM)** 处理
 - **解码瓶颈**是前端受限的常见原因之一
@@ -135,7 +136,7 @@ DSB 是已解码 uop 的缓存，**完全绕过解码流水线**，是首选解�
 - 以指令指针 (线性地址) 索引
 - 每路覆盖一个 **32 字节对齐**的代码区域
 - 若 32 字节区域包含的指令解码后超过一路的容量，则无法缓存到 DSB
-- DSB 吞吐 (6 uops/周期) 高于传统解码 (4-5 uops/周期)
+- DSB 吞吐 (6 uops/周期) 不低于传统解码 (Skylake/Sunny Cove 4 uops/周期、Golden Cove 6 uops/周期)，且命中时省去取指与解码两级流水
 
 **性能监控事件：**
 ```
@@ -182,16 +183,17 @@ ROB 按程序顺序跟踪所有在飞 uops，实现推测执行和顺序退休�
 
 | 端口 | 功能单元 | 说明 |
 |------|---------|------|
-| Port 0 | ALU, Vec ALU, Vec FMA, DIV, Vec Shift | 整数/向量计算, 除法 |
-| Port 1 | ALU, Vec ALU, Vec FMA, Vec Multiply, LEA | 整数/向量计算, 乘法 |
+| Port 0 | ALU, Vec ALU, Vec FMA, DIV, AES, Branch | 整数/向量计算, 除法, 分支执行 |
+| Port 1 | ALU, Vec ALU, Vec FMA, Vec Multiply, Bit Scan | 整数/向量计算, 乘法 |
 | Port 2 | Load AGU | 加载地址生成 |
 | Port 3 | Load AGU | 加载地址生成 |
 | Port 4 | Store Data | 存储数据 |
-| Port 5 | ALU, Vec ALU, Vec Shuffle, Branch | 整数/向量, 洗牌, 分支 |
+| Port 5 | ALU, Vec ALU, Vec Shuffle, LEA | 整数/向量, 洗牌, LEA |
 | Port 6 | ALU, Branch, Shift | 整数, 分支, 移位 |
-| Port 7 | Store AGU | 简单存储地址生成 |
+| Port 7 | Store AGU | 存储地址生成 |
 
 - 每周期最多：**2 loads + 1 store**
+- 分支执行端口为 Port 0 / Port 6 (Port 5 不执行分支，常见二手表格此处有误，见 §1.14.5 审计注 4)
 
 **Ice Lake+ (10 端口)：**
 
@@ -264,7 +266,7 @@ BACLEARS.ANY                      — 前端重新引导 (BPU 修正)
 | 行大小 | 64 字节 | 64 字节 |
 | 延迟 | 4 周期 | **5 周期** |
 | 加载带宽 | 2 × 64B/周期 | 2 × 64B/周期 |
-| 存储带宽 | 1 × 64B/周期 | **2 × 64B/周期** |
+| 存储带宽 | 1 × 32B/周期 (每周期 1 笔 256-bit 存储) | **每周期 2 笔存储数据操作** |
 
 > **注意：** Ice Lake 将 L1d 从 32KB 增加到 48KB，虽然延迟增加 1 周期，但显著降低了 L1d 未命中率。
 
@@ -346,14 +348,16 @@ Index + Offset = 7 + 6 = 13 位 > 12 位 ✗ (溢出页偏移，产生别名!)
 | 大小 | 1 MB | 1.25 MB | **2 MB** | **2-4 MB** |
 | 关联度 | 16 路 | 20 路 | 16 路 | 16 路 |
 | 延迟 | ~14 周期 | ~12-14 周期 | ~14-17 周期 | ~14-17 周期 |
-| 包含性 | 非包含 L1 | 非包含 L1 | 非包含 L1 | 非包含 L1 |
+| 包含性 | L2 **包含** L1；L3 非包含 | L2 **包含** L1；L3 非包含 | L3 非包含 | L3 非包含 |
+
+> **更正注：** Skylake-SP / Ice Lake-SP 的 **L2 对 L1 是包含式 (inclusive)**，旧版表格误写为"非包含 L1"；从 Skylake-SP 起变为非包含 (victim cache) 的是 **L3**。Golden Cove 及以后 L2 与 L1 的包含关系以各代手册为准。
 
 #### 1.5.5 L3 缓存 / 末级缓存 (LLC)
 
 | 参数 | Skylake-SP | Ice Lake-SP | Sapphire Rapids | Emerald Rapids | Granite Rapids |
 |------|-----------|-------------|-----------------|----------------|----------------|
-| 每核容量 | 1.375 MB | 1.5 MB | 1.875 MB | 1.875 MB | ~3 MB |
-| 典型总量 | ~38.5 MB | ~60 MB | ~112.5 MB | ~120 MB | ~360 MB |
+| 每核容量 | 1.375 MB | 1.5 MB | 1.875 MB | **5 MB** | **~4 MB** |
+| 典型总量 | ~38.5 MB | ~60 MB | ~112.5 MB | **最大 320 MB** | **最大 ~504 MB** (实测 480 MB @120 CHA) |
 | 关联度 | 11 路 | 12 路 | 15 路 | 15 路 | 可变 |
 | 延迟 | ~42-44 周期 | ~46-50 周期 | ~50-55 周期 | ~50-55 周期 | ~55-60 周期 |
 | 包含性 | **非包含** | 非包含 | 非包含 | 非包含 | 非包含 |
@@ -618,7 +622,7 @@ x86-64 四级页表：
 ```
 
 - **页表遍历缓存 (PWC)：** 缓存中间级页目录项以缩短遍历路径
-- 并发页表遍历器：2 个 (Skylake+)
+- 并发页表遍历器：Skylake 为 2 个 (该数量各代有变化，后续代次以各代优化手册为准)
 - 遍历延迟：最佳 ~7 周期 (所有级别缓存命中)；最差 ~50-100+ 周期 (访问 DRAM)
 
 #### 1.7.5 TLB 监控事件
@@ -886,7 +890,7 @@ CMP/TEST + 条件跳转 (JCC) → 融合为单个 uop
 融合条件:
 - 前一条是 CMP, TEST, ADD, SUB, AND, INC, DEC
 - 后一条是 JCC (条件跳转)
-- 两条指令必须在同一个 16 字节取指窗口内
+- 两条指令在程序顺序上相邻 (融合在 IQ 阶段完成, 见 §1.14.1 ⑥)
 ```
 
 ### 1.11 IPC 最大值分析
@@ -1178,6 +1182,217 @@ echo 0 > /sys/devices/system/cpu/cpu<sibling>/online
 
 > **核心结论：** HT 本质上是用单线程性能 (资源减半) 换取总吞吐量 (填充气泡)。对于内存延迟受限的负载效果最好，对于计算密集且缓存敏感的负载可能有害。PCM 的逐核心指标可直接对比 HT 开/关的效果差异。
 
+### 1.14 流水线组件功能详解 (对照微架构框图)
+
+> 本节按数据流顺序逐一解释核心流水线框图中**每个组件的功能**。框图参数以 **Skylake (客户端)** 为基准 (L2 256KiB 4-Way、ROB 224、RS 97、LB 72、SB 56、LFB 10)；服务器端与后续代次差异在文中标注并对照附录 A。节末附**审计注**，列出框图标注与实测微架构不一致之处，引用框图数值时务必先读审计注。
+
+**原图** (来源：知乎 @拓荒犬；参数为客户端 Skylake 口径；与实测的差异见 §1.14.5 审计注)：
+
+![Skylake 核心流水线框图](images/skylake-core-pipeline.png)
+
+**框图文本重绘** (按审计结论修正标签后的等价结构图，纯文本环境可读)：
+
+```
+┌─ Front End (顺序) ────────────────────────────────────────────────────────────────┐
+│ BPU → L1i (32KiB 8-Way; 附 L1i Tag / μOP Cache Tag; 与 ITLB 并行查找)              │
+│   →16B/cycle→ Fetch & PreDecode (16B 窗口) → IQ (50, Macro-Fusion)                │
+│   → 4-Way Decode (1 复杂 + 3 简单; 框图误标 5-Way) ⇄ MS ROM (4 uops/cyc)           │
+│   ⇄ DSB (1536 uops, 6 uops/cyc) + Stack Engine → MUX → IDQ (128, Micro-Fusion+LSD)│
+│ 回填: L2 →64B/cycle→ L1i                                                           │
+└───────────────────────────────┬───────────────────────────────────────────────────┘
+                                ▼ 4 uops/cyc (Skylake rename/allocate 宽度)
+┌─ Out-of-Order Back End ───────────────────────────────────────────────────────────┐
+│ RAT (4/cyc) + BOB (48) → Rename / Allocate / Retire + ROB (224)                    │
+│   [Move Elimination / Zeroing Idioms / Ones Idioms]                               │
+│ → Scheduler: Unified RS (97) + Int PRF (180) / Vec PRF (168)                       │
+│ → Port0 (ALU,DIV,FMA,AES,Br)  Port1 (ALU,MUL,FMA,BitScan)  Port5 (ALU,Shuffle,LEA) │
+│   Port6 (ALU,Br)  Port2/3 (Load AGU+Data)  Port4 (Store Data, 256b/cyc)           │
+│   Port7 (Store AGU)                                                               │
+│ → CDB (Load / FP / IntVect / Int / Store) 广播唤醒 RS                              │
+└───────────────────────────────┬───────────────────────────────────────────────────┘
+                                ▼
+┌─ Memory Subsystem ────────────────────────────────────────────────────────────────┐
+│ LB (72) / SB (56, store-to-load forwarding) ⇄ L1d (32KiB 8-Way; 附 DTLB)           │
+│ LFB (10) ←回填─ L2 (客户端 256KiB 4-Way; 附 Unified STLB);  L2 →32B/cycle→ L3      │
+│ 带宽: L2↔L1d/LFB 64B/cycle;  SB→L1d 32B/cycle;  Port4→SB 256bit/cycle              │
+└───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1.14.1 前端 (Front End，顺序供给与解码)
+
+**① Branch Predictor (BPU，分支预测器)**
+
+- **功能：** 整条流水线的"导航仪"。每周期向取指单元给出下一个取指地址：BTB 预测分支目标地址、方向预测器 (TAGE-like) 预测 taken/not-taken、RSB 预测函数返回地址、间接预测器预测间接跳转目标、循环检测器识别循环退出。BPU 跑在取指之前持续供给地址；后端确认误预测后，BPU 接受冲刷 (flush) 并重定向到正确目标。
+- **分析意义：** 误预测同时造成后端浪费 (Bad Speculation) 与前端气泡 (Fetch Latency)，事件与缓解手段见 §1.4。
+
+**② Instruction Cache Tag / μOP Cache Tag (双标签阵列)**
+
+- **功能：** 分别是 L1i 与 DSB 的标签阵列，每周期并行查找：L1i Tag 判定取指窗口是否命中指令缓存；μOP Cache Tag 判定该取指窗口是否已有解码好的 uops 驻留在 DSB 中。两者的命中结果共同决定本周期前端走哪条路径 (DSB 快路径 / L1i+MITE 慢路径)，是前端路径切换的决策依据。
+- **分析意义：** DSB 标签未命中迫使回退解码路径，用 `IDQ.DSB_UOPS` vs `IDQ.MITE_UOPS` 观察命中率。
+
+**③ L1 Instruction Cache (L1i，32KiB 8-Way)**
+
+- **功能：** 第一级指令缓存，64B 行、VIPT 组织 (见 §1.5.3)，与 ITLB 并行查找；每周期向取指/预解码单元供给 **16 字节取指窗口** (框图标注 16 Bytes/cycle)；未命中时由 L2 以 64B/cycle 回填。
+- **参数：** Skylake 起各代均为 32KB、8 路，命中延迟 ~4 周期。
+- **事件：** `ICACHE_MISSES.*`，是 Frontend Bound → Fetch Latency 的主要来源之一。
+
+**④ Instruction TLB (ITLB，指令 TLB)**
+
+- **功能：** 缓存指令侧"虚拟页号 → 物理页号"翻译，与 L1i 并行查找 (VIPT 的前提)；未命中先查统一 STLB，再未命中触发硬件页表遍历 (§1.7)。
+- **参数：** Skylake ITLB = 128 条目 ×4KB (8 路) + 8 条目 ×2MB (全关联)。
+- **事件：** `ITLB_MISSES.MISS_CAUSES_A_WALK`；代码侧用大页可显著消除指令遍历。
+
+**⑤ Instruction Fetch & PreDecode (取指与预解码，16B 窗口)**
+
+- **功能：** 按 BPU 给定地址每周期切出 16 字节取指窗口；预解码确定变长 x86 指令的边界与长度 (识别前缀、操作码、ModR/M、SIB、立即数)，标记指令起点，把指令以 **MOP (macro-op，未解码的 x86 指令)** 形式打包送入指令队列。
+- **约束：** 16B 窗口与"每周期最多 1 个 taken 分支"共同决定有效取指带宽上限；分支密集代码容易受前端带宽限制 (Fetch Bandwidth)。
+
+**⑥ Instruction Queue (IQ，50 条目) + Macro-Fusion (宏融合)**
+
+- **功能：** 缓冲预解码后的 MOPs，做对齐与速率平滑 (吸收取指突发、等待解码消费)；**宏融合在此完成**：相邻的 "CMP/TEST/ADD/SUB/AND/INC/DEC + JCC" 融合为单个 compare-and-branch uop，直接减少进入后端的 uop 数。
+- **参数：** 50 条目 (框图 2×25：SMT 双线程同时活跃时每逻辑线程 25 条目)。
+- **分析意义：** IQ 满会反压取指；宏融合率是实际 IPC 可超过退休宽度的原因之一 (§1.11)。
+
+**⑦ Decode 解码单元 (MITE 路径：Complex + Simple 解码器)**
+
+- **功能：** 把 x86 MOPs 翻译为内部 uops：简单解码器每周期每指令 1 uop；复杂解码器处理语义较复杂的指令，每指令 1–4 uops；超过 4 uops 的指令移交微码序列器 (MS ROM)。解码输出与 DSB、MS 的输出经 MUX 汇流送 IDQ。
+- **参数与审计：** **Skylake 实际为 4-wide 解码 (1 复杂 + 3 简单)，MITE 峰值 4 uops/周期**。框图标注 "5-Way Decode / 5 μOPs" 与 Skylake 实测不符 (见 §1.14.5 审计注 1)；Intel 的解码宽度从 4-wide (Skylake、Sunny Cove) 直接跳到 6-wide (Golden Cove)，中间不存在 5-wide 解码。
+- **事件：** `IDQ.MITE_UOPS` (经传统解码路径递送的 uops)。
+
+**⑧ MicroCode Sequencer ROM (MS ROM，微码序列器)**
+
+- **功能：** 微程序的存储与定序器：REP MOVS、CPUID、RDMSR、中断/异常入口等复杂指令由其定序产出 uop 流，以最多 4 uops/周期 (框图标注 4 μOPs) 送入前端汇流点；也是处理器微码更新 (microcode update) 与部分 machine clear 恢复路径的执行载体。
+- **分析意义：** `IDQ.MS_UOPS` 偏高说明代码依赖长微码序列 (如 FP assist、特定字符串操作)，常伴随 Retiring 偏高或 `MACHINE_CLEARS.*`。
+
+**⑨ Decoded Stream Buffer (DSB / μOP Cache，已解码流缓冲区)**
+
+- **功能：** 缓存已解码 uops，以取指窗口线性地址索引；命中时**绕过取指与解码**直接向 IDQ 递送 uops (Skylake 6 uops/周期)，是首选前端路径：带宽更高、功耗更低。未命中或切换惩罚时回退 MITE 解码。
+- **参数：** Skylake 1536 uops = 32 组 × 8 路 × 6 uops/路；每一路对应一个 **32 字节对齐**的代码区域 (框图 "64 B window" 标注对 Skylake 不准确，见审计注 2)。
+- **事件：** `IDQ.DSB_UOPS`、`DSB2MITE_SWITCHES.PENALTY_CYCLES`；代码布局与对齐优化以提高 DSB 命中率是标准前端优化手段 (§19.4)。
+
+**⑩ Stack Engine (SE，栈引擎)**
+
+- **功能：** 硬件栈地址引擎：对 PUSH/POP/CALL/RET 类栈操作，用内部加法器 (框图画 3 个) 增量维护 RSP，把栈指针更新**折叠进内存访问 uop 本身**，避免为 RSP 的加减单独产生 uop 去占用执行端口；与重命名阶段的 Move Elimination 协同，共同压低后端有效执行压力。
+
+**⑪ MUX (前端路径多路选择器)**
+
+- **功能：** 在前端多个 uop 来源 (MITE 解码、DSB、MS ROM，以及 Stack Engine 的输出) 之间做仲裁：每周期最多一个来源占用通往 IDQ 的递送通道；负责 DSB↔MITE 切换时序与气泡插入，是前端路径选择逻辑的物理执行点。
+
+**⑫ Allocation Queue (IDQ，128 条目) + Loop Stream Detector (LSD) + Micro-Fusion (微融合)**
+
+- **功能：** 前端与后端的交接队列：缓冲等待分配的 uops，吸收"前端突发、后端停顿"的速率差；**微融合在此完成**：把 "load+运算" 等 uop 对折叠为单个 fused-domain uop (在后端分发到端口时再拆解)；**LSD** 检测稳定重复执行的小循环，命中后循环体直接从 IDQ 侧缓冲重放，前端 (取指/解码) 停止做功，省功耗也省带宽。
+- **LSD 可用性注：** Skylake 的 LSD 因硬件缺陷在 2017 年的 microcode 更新中被**禁用** (Inria 对 Skylake LSD bug 的分析)；该特性在后续代次的存在形式不一 (如 Redwood Cove 仍以 uop queue 作为 loop buffer 实现)，引用时以目标平台实际微码/微架构为准。
+- **参数：** 128 条目 (框图 2×64：SMT 双线程同时活跃时每线程 64 条目)。
+- **分析意义：** IDQ 递送不足是 TMAM Frontend Bound 的直接测量点 (`IDQ_UOPS_NOT_DELIVERED.CORE`)。
+
+#### 1.14.2 后端 I：重命名 / 分配 / 退休 (顺序记账，乱序的使能者)
+
+**⑬ Register Alias Table (RAT，寄存器别名表)**
+
+- **功能：** 维护"架构寄存器 → 物理寄存器"映射表；重命名时为每个目的操作数分配新物理寄存器并更新映射，消除 WAR/WAW 假依赖，使乱序执行成为可能。Skylake 每周期重命名 4 个 uop (框图标注 4 μOP)。每逻辑线程私有一份 (§1.13)；分支误预测时借助检查点/回滚机制恢复映射快照。
+
+**⑭ Branch Order Buffer (BOB，48 条目)**
+
+- **功能：** 按程序顺序记录在飞分支的专用顺序结构：误预测或异常发生时，快速定位出错点之后的全部推测分支，协同 RAT 检查点与 ROB 完成状态回滚和重定向。其容量限制了同时在飞的分支数量。
+
+**⑮ Rename / Allocate / Retirement + ReOrder Buffer (ROB，224 条目)**
+
+- **功能：** 后端总记账级，同一阶段完成三件事：**Allocate** 为 uop 分配 ROB 表项、物理寄存器、LB/SB 条目 (任一资源不足即停顿)；**Rename** 完成映射与习语识别；**Retirement** 按程序顺序从 ROB 头部提交 uop、更新架构状态、回收物理寄存器与表项。ROB 记录所有在飞 uop 的执行/异常状态，是"乱序执行、顺序退休"与推测恢复的物理载体。
+- **同级附带优化逻辑 (框图同框)：**
+  - **Move Elimination：** `MOV reg,reg` 等寄存器移动在重命名阶段靠物理寄存器指针改写完成，不占执行端口；
+  - **Zeroing Idioms：** `XOR reg,reg` / `SUB reg,reg` 等清零习语在重命名阶段被识别，结果直接接常量零，不占执行端口；
+  - **Ones Idioms：** 向量自比较 (如 `PCMPEQD xmm,xmm`) 等全一习语同样在此被识别处理，避免真实执行。
+- **宽度：** Skylake 分配/退休 4 uops/周期；Sunny Cove 5；Golden Cove 及以后 6 (§1.3.5)。
+
+**⑯ Scheduler / Unified Reservation Station (RS，统一保留站，97 条目)**
+
+- **功能：** 保存已重命名但操作数未就绪的 uops：每个表项监听源操作数标签，CDB 广播的写回标签命中即唤醒；全部源操作数就绪的 uop 按年龄/就绪度仲裁，issue 到其绑定的执行端口。Skylake 为统一 RS (整数/向量共享 97 条目)；后续代次容量扩大并改为拆分式调度器 (附录 A)。
+- **分析意义：** RS 满会阻塞分配 (`RESOURCE_STALLS.*`)；调度器容量与唤醒延迟决定了可挖掘的指令级并行度。
+
+**⑰ Integer / Vector Physical Register File (物理寄存器文件，180 / 168)**
+
+- **功能：** 保存物理寄存器的当前值：源操作数唤醒后由此读出 (或经旁路提前获得)，执行结果写回于此并向 CDB 广播。PRF 与 ROB 分离使退休只需回收"映射"而无需搬移数据。Skylake：整数 180 项、向量 168 项 (256-bit 宽)；AVX-512 代次起向量 PRF 以 512-bit 组织，条目数相应调整 (§1.3.4)。
+
+**⑱ Execution Ports & Execution Units (执行端口与执行单元，Port 0–7)**
+
+- **功能：** uop 真正完成运算/访存的物理场所。Skylake 共 8 个端口，每端口绑定固定的功能单元组合 (按框图)：
+
+| 端口 | 功能单元 (Skylake，按框图) | 角色概要 |
+|------|---------------------------|---------|
+| Port 0 | INT ALU, INT DIV, INT Vect ALU, INT Vect MUL, FP FMA, AES, Vect String, FP DIV, Branch | 重计算：整/浮点除法、FMA、AES |
+| Port 1 | INT ALU, INT MUL, INT Vect ALU, INT Vect MUL, FP FMA, Bit Scan | 乘法类与通用向量运算 |
+| Port 5 | INT ALU, Vec Shuffle, INT Vect ALU, LEA | 洗牌/向量搬移、地址计算 LEA |
+| Port 6 | INT ALU, Branch | 轻量 ALU 与第二个分支执行端口 |
+| Port 2 | AGU + Load Data | 加载地址生成 + 加载数据返回 |
+| Port 3 | AGU + Load Data | 第二加载通道 |
+| Port 4 | Store Data | 存储数据写入 Store Buffer (256bit/cycle) |
+| Port 7 | AGU | 存储地址生成 |
+
+- **吞吐概要：** Skylake 每周期最多 2 loads + 1 store；Ice Lake 起增加存储通道至 2 loads + 2 stores (§1.3.3)。分支执行落在 Port 0 / Port 6 (审计注 4)。
+- **事件：** `UOPS_DISPATCHED_PORT.*` / `UOPS_EXECUTED.PORT.*` 用于端口压力定位 (§19.1 步骤 3C)。
+
+**⑲ Common Data Buses (CDB，公共数据总线)**
+
+- **功能：** 结果广播网络：执行结果写回 PRF 的同时经 CDB 向 RS 广播，唤醒等待该标签的 uop (tag-match wakeup / bypass)。框图按功能列出 5 组 CDB：Load、FP、Int Vect、Int、Store。CDB 条数限制了每周期可完成"写回+唤醒"的 uop 数，是后端一条隐性带宽约束。
+
+#### 1.14.3 内存子系统：Load/Store 与缓存层次
+
+**⑳ Load Buffer (LB，加载缓冲区，72 条目)**
+
+- **功能：** 追踪所有在飞加载：记录地址、状态与顺序信息，负责 load-load / load-store 顺序检查和内存顺序违规检测 (违规触发重放乃至 machine clear)；未命中的加载挂起表项，等 LFB 取回数据后唤醒依赖 uop。
+- **事件：** `MACHINE_CLEARS.MEMORY_ORDERING` (顺序违规重放)、`L1D_PEND_MISS.*` (未命中挂起)。
+
+**㉑ Store Buffer & Forwarding (存储缓冲区与转发，56 条目)**
+
+- **功能：** 缓冲地址/数据已就绪但尚未提交到缓存的存储：对后续加载提供 **store-to-load forwarding** (不经缓存、直接从缓冲区取数，~4-5 周期)；存储退休后按程序顺序 drain 到 L1d (框图标注 32B/cycle)。它是 x86 TSO 内存模型的核心硬件机制 (§1.8)：存储对外按序可见、加载可提前转发。
+- **事件：** `RESOURCE_STALLS.SB` (SB 满停顿)；转发失败规则见 §1.6。
+
+**㉒ L1 Data Cache (L1d，32KiB 8-Way)**
+
+- **功能：** 第一级数据缓存：64B 行、VIPT、写回；Skylake 每周期 2×64B 加载、1 笔 256-bit (32B) 存储 (与框图 Port 4→SB 的 256bit/cycle 标注一致)，命中延迟 ~4 周期；Ice Lake 起扩为 48KB/12 路/5 周期 (§1.5.2)。
+- **事件：** `MEM_LOAD_RETIRED.L1_HIT` / `L1_MISS`。
+
+**㉓ Data TLB (DTLB，数据 TLB)**
+
+- **功能：** 数据侧地址翻译，与 L1d 并行查找 (VIPT)；未命中查 STLB，再未命中触发页表遍历。Skylake DTLB = 64 条目 ×4KB (4 路) + 32 条目 ×2MB (4 路) + 4 条目 ×1GB (全关联) (§1.7.1)。
+- **事件：** `DTLB_LOAD_MISSES.*` / `DTLB_STORE_MISSES.*`。
+
+**㉔ Line Fill Buffers (LFB，行填充缓冲区，10 条目)**
+
+- **功能：** L1d 未命中处理队列 (MSHR 角色)：记录已未命中但数据未回的缓存行请求，合并同行多次未命中，向 L2 发出回填请求；数据返回后写入 L1d 并唤醒 LB 中挂起的表项。LFB 全占满时后续未命中必须等待 (`L1D_PEND_MISS.FB_FULL`)，是流式访问下"未命中并发度耗尽"的经典信号。
+
+**㉕ Unified STLB (统一二级 TLB)**
+
+- **功能：** 指令/数据侧共享的 L2 TLB：L1 ITLB/DTLB 未命中后到此翻译；统一存储多种页面大小，靠每条目 PageSize 字段 + 掩码比较区分 (§1.7.3)；仍未命中则触发硬件页表遍历。Skylake 1536 条目 12 路；Ice Lake 起 2048 条目 16 路。
+- **事件：** `DTLB_LOAD_MISSES.STLB_HIT` 等。
+
+**㉖ L2 Cache (MLC，中级缓存)**
+
+- **功能：** 指令/数据统一的私有中级缓存：承接 L1i/L1d 未命中 (框图标注 64B/cycle 回填路径)，响应来自 L3 的 snoop/filter 请求，也是 L2 预取器的落点；未命中再下到 L3 (框图标注 32B/cycle，客户端带宽)。
+- **参数：** 框图为客户端 Skylake：256KiB 4-Way；同代服务器 Skylake-SP 为 1MiB 16-Way，Ice Lake-SP 及以后见附录 A (§1.5.4)。
+- **事件：** `MEM_LOAD_RETIRED.L2_HIT` / `L2_MISS`、`L2_RQSTS.*`。
+
+#### 1.14.4 框图互联带宽标注汇总 (Skylake 客户端口径)
+
+| 标注 | 位置 | 含义与审计 |
+|------|------|-----------|
+| 16 Bytes/cycle | L1i → Fetch/PreDecode | 取指窗口带宽，各代一致 |
+| 64B/cycle | L2 → L1i | 指令侧回填带宽 |
+| 64B/cycle | L2 ↔ L1d / LFB | 数据侧回填与写回路径带宽 |
+| 32B/cycle | L2 → L3 | 客户端 L2 到 L3 带宽 (服务器端更高) |
+| 256bit/cycle | Port 4 → Store Buffer | 存储数据写入路径 = 32B/cycle，即 Skylake 峰值存储带宽为每周期 1 笔 256-bit 存储 |
+| 32B/cycle | Store Buffer → L1d | 存储 drain 带宽，与上一行自洽 |
+| 32B/cycle | Load Buffer ↔ L1d | 框图标注；注意 Skylake L1d 加载侧峰值为 2×64B/cycle，此标注应理解为单返回路径口径 (审计注 5) |
+
+#### 1.14.5 审计注：框图标注与实测微架构的差异
+
+1. **"5-Way Decode" 不成立于 Skylake：** Skylake MITE 解码实际为 4-wide (1 复杂 + 3 简单)，峰值 4 uops/周期；框图画 5 个解码器并标 "5 μOPs" 输出与实测不符。Intel 解码宽度从 4-wide (Skylake、Sunny Cove) 直接跳到 6-wide (Golden Cove/Sapphire Rapids)；Sunny Cove 加宽到 5 的是**重命名/分配/退休**级，而非解码级。
+2. **DSB "64 B window"：** Skylake 每个 DSB way 对应 32 字节对齐代码区域，64B 窗口标注与 Skylake 不符。
+3. **L2 256KiB 4-Way 是客户端配置：** 同代服务器 Skylake-SP 为 1MiB 16-Way，引用时勿混用 (附录 A)。
+4. **分支执行端口：** Skylake 分支执行在 Port 0 与 Port 6 (框图本身画法正确)；常见二手表格 (含本笔记旧版) 误把 Branch 放在 Port 5，已在本节与 §1.3.3 更正。
+5. **加载侧带宽口径：** 框图 LB 旁 "32B/cycle" 与 Skylake L1d 2×64B/cycle 加载峰值不一致，应理解为单返回路径口径或绘图简化。
+6. **存储带宽口径：** Skylake 峰值存储为每周期 1 笔 256-bit (32B)，而非 64B；Ice Lake 起为每周期 2 笔存储数据操作 (§1.5.2 已同步更正)。
+
 ---
 
 ## 第2章 内存子系统架构
@@ -1266,7 +1481,7 @@ Intel 集成内存控制器位于 CPU Uncore/Mesh 中：
 
 | 平台 | 通道配置 | 支持 |
 |------|---------|------|
-| Skylake-SP | 6 通道 (3 iMC × 2 通道) | DDR4-2666 |
+| Skylake-SP | 6 通道 (2 iMC × 3 通道) | DDR4-2666 |
 | Ice Lake-SP | 8 通道 (4 iMC × 2 通道) | DDR4-3200 |
 | Sapphire Rapids | 8 通道 (4 iMC × 2 通道) | DDR5-4800 |
 | Emerald Rapids | 8 通道 | DDR5-5600 |
@@ -1375,7 +1590,9 @@ NUMA 比率:    1.5x - 2.0x
 |------|------|------|----------------|--------|
 | QPI | Nehalem-Broadwell | 6.4-9.6 GT/s | 19.2-24 GB/s | 2-3 |
 | UPI 1.0 | Skylake-SP/CLX | 10.4 GT/s | 20.8 GB/s | 3 |
-| UPI 2.0 | Ice Lake-SP/SPR | 16.0 GT/s | 32 GB/s | 3-4 |
+| UPI 1.0/1.1 | Ice Lake-SP | 11.2 GT/s | 22.4 GB/s | 2-3 |
+| UPI 2.0 | Sapphire Rapids/Emerald Rapids | 16.0 GT/s | 32 GB/s | 3-4 |
+| UPI 2.0 | Granite Rapids | 20.0 GT/s | 40 GB/s | 3-4 |
 
 **UPI 承载的流量类型：**
 - 缓存一致性流量 (snoop 请求、数据传输、失效)
@@ -1746,15 +1963,18 @@ PASID 使每个设备支持多个独立地址空间：
 | Fixed 0 | `INST_RETIRED.ANY` | IA32_FIXED_CTR0 | 退休指令数 |
 | Fixed 1 | `CPU_CLK_UNHALTED.THREAD` | IA32_FIXED_CTR1 | 核心时钟周期数 |
 | Fixed 2 | `CPU_CLK_UNHALTED.REF_TSC` | IA32_FIXED_CTR2 | 参考频率周期数 |
-| Fixed 3 (SKL+) | `TOPDOWN.SLOTS` | IA32_FIXED_CTR3 | 总流水线槽位 |
+| Fixed 3 (ICL+) | `TOPDOWN.SLOTS` | IA32_FIXED_CTR3 | 总流水线槽位 (Ice Lake 之前无此固定计数器) |
+| Fixed 4 (ICL+) | `PERF_METRICS` | IA32_FIXED_CTR4 | 硬件直接给出 Topdown L1 各类别占比 (ICL+) |
 
 ### 5.3 通用可编程计数器 (GP Counters)
 
 | 特性 | 值 |
 |------|------|
-| 每逻辑核心 GP 计数器 | 4 (超线程关闭时可达 8) |
+| 每逻辑核心 GP 计数器 | 4 (Skylake、Ice Lake)；其他代次以 CPUID leaf 0AH 的 EAX[23:16] 枚举为准 |
 | 计数器宽度 | 48 位 |
 | 配置寄存器 | IA32_PERFEVTSELx (事件选择) + IA32_PMCx (计数值) |
+
+**注意：** GP 计数器按**逻辑核心**独立配置 (每个 SMT 线程各自拥有一组)，关闭超线程**不会**使每核计数器数量翻倍——旧版"超线程关闭时可达 8"的说法有误。
 
 **事件选择器字段：**
 
@@ -3799,7 +4019,7 @@ echo "=== Collection Complete ==="
 |------|-----------|-------------|-----------------|----------------|----------------|
 | 核心代号 | Skylake | Sunny Cove | Golden Cove | Golden Cove | Redwood Cove |
 | 分配/退休宽度 | 4 | 5 | 6 | 6 | 6 |
-| 解码器数 | 4 | 5 | 6 | 6 | 6 |
+| 解码宽度 | 4 | 4 | 6 | 6 | 6 |
 | uop 缓存 | 1536 | 2304 | 4096 | 4096 | 4096+ |
 | ROB | 224 | 352 | 512 | 512 | 512+ |
 | 调度器 | 97 | 160 | 224 | 224 | 256+ |
@@ -3810,7 +4030,7 @@ echo "=== Collection Complete ==="
 | 浮点 PRF | 168 | 224 | 332 | 332 | 384+ |
 | L1d | 32KB/8路/4c | 48KB/12路/5c | 48KB/12路/5c | 48KB/12路/5c | 48KB/12路/5c |
 | L2 | 1MB/16路 | 1.25MB/20路 | 2MB/16路 | 2MB/16路 | 2-4MB |
-| L3/核 | 1.375MB | 1.5MB | 1.875MB | 1.875MB | ~3MB |
+| L3/核 | 1.375MB | 1.5MB | 1.875MB | 5MB | ~4MB |
 | 最大核数/Socket | 28 | 40 | 60 | 64 | 128 |
 | 内存 | DDR4-2666 | DDR4-3200 | DDR5-4800 | DDR5-5600 | DDR5-6400 |
 | PCIe | Gen 3 | Gen 4 | Gen 5 | Gen 5 | Gen 5 |
@@ -3963,8 +4183,8 @@ PCM_PRINT_TOPOLOGY=1 sudo pcm 1 -i=1
 
 ---
 
-> **手册版本：** v3.0 (新增 Uncore Box 详解、Offcore 概念、降频判断、Uncore 事件解码)
-> **最后更新：** 2026-06-04
+> **手册版本：** v3.1 (修正解码宽度、执行端口分工、存储带宽、UPI 速率等事实性错误；新增 §1.14 流水线组件功能详解与框图审计注)
+> **最后更新：** 2026-11-08
 > **基于 PCM 版本：** 202604+
 > **参考资料：**
 > - Intel PCM GitHub: https://github.com/intel/pcm
