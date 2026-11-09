@@ -236,6 +236,41 @@ ROB 按程序顺序跟踪所有在飞 uops，实现推测执行和顺序退休�
 - 误预测惩罚：**~14-17 个周期** (DSB 路径 ~14, 传统解码路径 ~16-17)
 - 流水线刷新并从正确目标重新开始
 
+**误预测何时被发现：** 在**分支于分支执行单元上执行完成的那一刻**（Skylake 为 Port 0 / Port 6，见 §1.14.5 审计注 4）——不是退休时。分支单元算出真实方向/目标，与取指时带下来的预测信息比较，不一致就立即触发冲刷和重定向；退休只是提交点。
+
+```
+周期 0        BPU 给出预测 (方向 + 目标)，开始取"错误路径"的指令
+              预测信息随分支 uop 附带，一路跟着流过前端和后端
+周期 ~1-5     错误路径指令被取指、解码、进入 IDQ
+周期 ~4-8     分支 uop 本身被分配/重命名，进入 RS 等待操作数
+周期 ~8-12    操作数就绪，分支被分发到 Port 0/6 执行
+              → 算出真实方向/目标
+              → 与随路携带的预测信息比较
+              → 不一致 = 确认误预测        ← "知道"的时刻
+周期 ~12-14   冲刷: 取消该分支之后的全部年轻 uop
+              重定向: 前端从正确地址重新取指
+              (RAT 检查点恢复重命名映射, BOB 定位出错分支, §1.14.2 ⑬⑭)
+周期 ~14-17   第一条正确路径的 uop 到达后端
+```
+
+~14-17 周期的惩罚，本质就是从"发现并重定向"到"第一条正确 uop 抵达后端"的时间——前端流水线要重新灌满。
+
+**关键变量：操作数什么时候就绪。** 分支必须等操作数就绪才能执行，所以"什么时候知道"由最慢的操作数决定：
+
+| 分支类型 | 解析依赖 | 何时知道预测错 |
+|---------|---------|--------------|
+| 条件取决于寄存器/ALU 结果 | 1-4 周期的生产者 | ~14-17 周期的教科书值 |
+| 条件取决于 L1d 命中的 load | 再加 ~4-5 周期 | 略晚 |
+| 条件取决于 DRAM load | 再加 ~100-200 周期 | **错误路径继续执行几百周期** |
+| RET | 要从栈上读回返回地址（本身就是一笔 load） | 取决于栈访问延迟，RSB 误预测因此格外慢 |
+| 间接跳转 (JMP *rax) | 寄存器值 | 寄存器何时产生（来自 load 就要跟着等） |
+
+这就是为什么"分支条件依赖长延迟数据"是最恶劣的误预测：等待期间前端一直在供给错误路径，ROB 里塞满注定作废的 uop。
+
+**为什么不等退休再确认：** 推测执行的意义就是用尽量小的代价走错路。如果等顺序退休才确认误预测，ROB 深度内的所有工作都得是错误路径，惩罚会膨胀到 ROB 深度量级（几百周期）。所以硬件选择在执行时确认、立即冲刷。这也解释了一个监控现象：`BR_MISP_RETIRED.*` 在**退休时**计数（为了精确归因，PEBS 也在这里采样），但冲刷发生在几十甚至几百周期之前——事件计数的时间点和实际恢复时刻是脱钩的。
+
+**错误路径 uop 的下场：** 它们不是"退休后回滚"，而是**被取消**：在飞期间真实占用过资源（ROB/RS/LB/SB 表项、执行端口），冲刷时被标记无效、永不退休。所以高误预测率浪费的不只是前端取指解码的功，还有后端资源——TMAM 的 Bad Speculation 类别 (§6.2) 度量的正是这部分被浪费的槽位。
+
 #### 1.4.3 监控事件
 
 ```
@@ -341,6 +376,48 @@ Index + Offset = 7 + 6 = 13 位 > 12 位 ✗ (溢出页偏移，产生别名!)
 
 > **L1i 同理：** L1i 32KB/8路 → 64组 → Index = 6位，Index+Offset = 12位，恰好满足约束。
 
+**横向对照：ARM 与 Apple 如何处理同一个问题**
+
+ARM 应用处理器的 L1 缓存同样是 VIPT，但在"怎么对付别名"上与 Intel 分成了两条路线：
+
+| | Intel | ARM 主流 (Cortex-A / Neoverse) | Apple Silicon |
+|---|---|---|---|
+| L1 寻址方式 | VIPT | VIPT (ARMv7 起统一为物理打标签) | VIPT |
+| 几何设计 | **严守** Index+Offset ≤ 12 位 | **故意突破**约束 | 严守约束，但预算按 16KB 页计算 |
+| 别名解决 | 设计约束，天生免疫 | 硬件别名处理 | 设计约束 (靠 16KB 页) |
+| L2 及以上 | PIPT | PIPT | PIPT |
+
+**ARM 主流：故意突破约束，硬件兜底。** 几个真实的 L1d 几何参数 (均为 64B 行)：
+
+```
+Cortex-A53:   32KB / 2路  → 256 组 → 8 位索引 → Index+Offset = 14 位 > 12 ✗
+Cortex-A72:   32KB / 2路  → 256 组 → 8 位索引 → 14 位 > 12 ✗
+Cortex-A76:   64KB / 4路  → 256 组 → 8 位索引 → 14 位 > 12 ✗
+Neoverse N1:  64KB / 4路  → 256 组 → 8 位索引 → 14 位 > 12 ✗
+```
+
+注：Cortex-A53 的 L1d 容量可配置 (8/16/32KB)，上表取 32KB 最大配置；其余各核为固定容量。
+
+按 Intel 的标准这些设计全部"违规"——4KB 页下每个物理行理论上可能落进最多 4 个候选组 (越界的是 bit 12、13 两位)。正确性由架构规范兜底：ARM 架构手册要求按虚拟地址执行的缓存维护指令 (ARMv8 如 `DC CIVAC`) 对**翻译后的物理地址**生效，synonym 问题必须由硬件实现自行解决，操作系统不做页着色 (Page Coloring)。
+
+硬件兜底可行的关键在于**越界位数很少**：越 1~2 位意味着每个物理地址的候选组只有 2~4 个，是有界的小集合——硬件可以在填充时探测其他候选组，发现同一物理行就合并或作废其一；缓存维护操作时也可把候选组全部查一遍。具体机制属实现定义，各核不完全公开，但思路都是"候选集小，查得起"。
+
+**为什么 ARM 宁可付这个硬件代价？** 约束几何对低功耗设计太不友好：Intel 那条路要 48KB 就得配 12 路，路数越多 Tag 比较的面积和功耗越大；ARM 小核追求 2 路这种省电几何，若也守约束，32KB/2 路根本无解。ARM 把复杂度花在别名检测逻辑上，换回几何选择的自由。
+
+**Apple Silicon：设计约束派，但换了页大小。** macOS/iOS 使用 **16KB 页**，页内偏移有 14 位，无别名预算从 12 位放宽到 14 位：
+
+```
+M1 (Firestorm) L1d: 128KB / 8路 / 64B 行 (Apple 官方优化指南口径)
+  组数 = 128KB / (8 × 64B) = 256 组 → 8 位索引
+  Index + Offset = 8 + 6 = 14 位 = 16KB 页偏移 ✓ 恰好压线
+```
+
+同样的 128KB/8 路几何放在 4KB 页世界 (x86) 里会严重违规，配上 16KB 页就成了天生无别名的超大 L1。Apple 选 16KB 页有 TLB 效率的考虑，但能让 128KB L1d 以 8 路这种温和关联度无别名地存在，应是页大小与缓存几何协同设计的结果。
+
+**历史演进：** 早期 ARM 核心 (如 ARM9 系列) 使用 VIVT 缓存，别名与 homonym 都要靠上下文切换时冲刷整个缓存解决；ARMv7 起统一为物理打标签的 VIPT，一致性不再依赖冲刷。
+
+> **两派取舍的本质：** Intel/Apple 用几何自由度换运行时零开销与验证简单；ARM 用一块别名检测逻辑换几何自由度。这也解释了为什么同样是 64KB L1d，Intel 做不到 (会撞 12 位墙) 而 ARM 遍地都是。
+
 #### 1.5.4 L2 缓存 (MLC)
 
 | 参数 | Skylake-SP | Ice Lake-SP | Sapphire Rapids | Granite Rapids |
@@ -364,6 +441,8 @@ Index + Offset = 7 + 6 = 13 位 > 12 位 ✗ (溢出页偏移，产生别名!)
 | 互联拓扑 | Mesh | Mesh | Mesh/Tile | Mesh/Tile | Mesh/Tile |
 
 > **重要架构变化：** 从 Skylake-SP 开始，Intel 从**环形互联 + 包含式 L3** 转变为**网格互联 + 非包含式 L3**。L3 作为 **victim cache** 和 **snoop filter** 运作。这对缓存一致性和性能监控的解读有重要影响。
+
+> **互联拓扑详解：** 表中 "Mesh/Tile" 的含义、Tile (多 die) 架构各代形态及其对延迟和性能分析的影响，见 §2.8。
 
 #### 1.5.6 缓存性能监控事件
 
@@ -427,6 +506,58 @@ OFFCORE_RESPONSE                         — 跨核/内存访问 (高度可配�
 L1D_PEND_MISS.PENDING     — L1D 未命中挂起周期 (LFB 占用)
 L1D_PEND_MISS.FB_FULL     — LFB 全满周期 (停顿指标)
 ```
+
+**澄清：L1i 未命中不走 LFB。** LFB 是 L1d 专属结构。指令取指未命中由 IFU 内部的未命中跟踪结构记录（可挂起的 outstanding 数量远少于 LFB 条目），请求直接发往 L2——两条路径在 L2 汇合，L2 不区分请求来源。分开设计的动机：取指语义简单（纯读、顺序加分支引导），不需要共享数据未命中的复杂状态跟踪；且两者互不挤占——LFB 全满只停顿数据侧未命中，不影响取指，反之亦然。
+
+**监控含义：** `L1D_PEND_MISS.*` 只反映数据侧，I-cache 未命中压力在这些事件里完全不可见，应通过 TMAM Frontend Bound → Fetch Latency、`ICACHE_MISSES.*`、`L2_RQSTS.DEMAND_CODE_RD_MISS` (从 L2 视角看取指未命中) 观察。
+
+**写合并兼职：** LFB 同时充当**写合并缓冲区 (Write Combining Buffer, WCB)**——WC 内存类型的存储和 non-temporal store (见下一小节) 经由它排出，所以"LFB 满"的成因不止 load 未命中一种。
+
+#### Non-Temporal Store (非临时存储)
+
+Non-temporal store（指令名带 `NT` 后缀，如 `MOVNTI`、`MOVNTDQ`、`VMOVNTDQ`）是**绕过缓存层次、不产生缓存行分配**的存储指令：数据不在 L1d/L2 驻留，先在写合并缓冲区 (WCB，即 LFB 结构) 凑成整行，然后直接写往内存。
+
+**解决的问题：RFO 与缓存污染。** x86 是 write-allocate 策略，普通 store 写一条不在缓存中的行必须先取得所有权：
+
+```
+普通 store 写 1GB 缓冲区 (数据完全不在缓存中):
+  1. RFO (Read For Ownership): 把缓存行从内存读进 L1d
+     —— 哪怕马上就要整行覆盖掉
+  2. 修改缓存行
+  3. 缓存行被驱逐时写回内存
+  内存流量 ≈ 1GB 读 (RFO) + 1GB 写回 = 2GB
+  副作用: 一次性流式数据把真正有复用价值的工作集全部驱逐 (缓存污染)
+
+NT store 写同样 1GB:
+  1. 数据进入 WCB，凑满完整 64B 行后以整行写直接排出到内存
+     —— 不需要 RFO，也不分配缓存行
+  内存流量 ≈ 1GB 写
+  副作用: 缓存完全不被触碰
+```
+
+**适用判据：** 数据写完短期内不会再读（流式写）。如果写完马上要读回来，NT store 反而帮倒忙——读时缓存里没有，一路 miss 到内存。
+
+**内存序陷阱 (C 程序员关键考点)：** NT store 按 WC 语义处理，**不享受 x86 TSO 的 store-store 顺序保证**——它可以和普通 store、其他 NT store 互相乱序。经典"数据 + 门铃"模式：
+
+```c
+#include <immintrin.h>
+
+void produce(void *dst /* 64B 对齐 */, size_t len, __m256i data,
+             volatile int *doorbell) {
+    for (size_t i = 0; i < len; i += 32)
+        _mm256_stream_si256((__m256i *)((char *)dst + i), data);
+
+    _mm_sfence();      // 关键! 保证所有 NT 数据先于门铃全局可见
+
+    *doorbell = 1;     // 普通 store 通知消费者
+}
+```
+
+没有 `_mm_sfence()`，消费者可能先看到 `doorbell == 1`、后看到 NT 数据还没落地——门铃走 store buffer，NT 数据走 WCB，是两条独立排空的路径。SFENCE 的排空机制见 §1.8.2。
+
+**其他约束：** SIMD 版 NT 指令要求操作数对齐（16/32/64 字节按指令宽度，否则 `#GP`）；要发挥效果应**连续写满整个 64B 行**，只写半行会触发实现去合并旧内容，收益大打折扣。
+
+**在哪里会遇到：** glibc 的大块 `memset` 在许多平台上有 NT store 实现；大块拷贝的另一条路线是 ERMS（增强版 `REP MOVSB/STOSB`），解决同一问题；编译器提供 `__builtin_nontemporal_store(value, ptr)`；本笔记 §20.2 场景 1 的"Non-Temporal Stores 避免无用的缓存行填充"说的就是它。另有反方向的 non-temporal load（`MOVNTDQA`），主要用于读 WC 类型内存（如设备 framebuffer），对普通 WB 内存基本退化为普通加载。
 
 ### 1.7 TLB 结构与页表遍历
 
@@ -652,12 +783,27 @@ x86/x86-64 实现**全存储排序 (TSO)**，是较强的内存一致性模型�
 
 #### 1.8.2 内存屏障
 
-| 指令 | 类型 | 用途 |
-|------|------|------|
-| `MFENCE` | 全屏障 | 序列化所有加载和存储 |
-| `LFENCE` | 加载屏障 | 序列化加载 (Intel 上也序列化指令执行，用于 Spectre 缓解) |
-| `SFENCE` | 存储屏障 | 序列化存储 (主要用于 non-temporal stores) |
-| `LOCK` 前缀 | 全屏障 | 使读-修改-写原子化并充当全屏障 |
+| 指令 | 类型 | 用途 | 覆盖 WCB/NT store |
+|------|------|------|------------------|
+| `MFENCE` | 全屏障 | 序列化所有加载和存储 | 是 |
+| `LFENCE` | 加载屏障 | 序列化加载 (Intel 上也序列化指令执行，用于 Spectre 缓解) | 不涉及 |
+| `SFENCE` | 存储屏障 | 序列化存储 (主要用于 non-temporal stores) | 是 |
+| `LOCK` 前缀 | 全屏障 | 使读-修改-写原子化并充当全屏障 | 是 |
+
+**SFENCE 的真实语义：排空 (drain)，不是 flush。** SFENCE 不会作废或清除任何东西，它是一个**排序屏障**：保证它之前的所有存储——无论当时在 store buffer 还是在 WCB (即 LFB，见 §1.6) 里——都在任何后续存储之前到达全局可见点：
+
+```
+普通 WB store → Store Buffer ──┐
+                               ├── SFENCE: 等两条路径都排空到全局可见点，
+NT / WC store → WCB (即 LFB) ──┘     才允许它之后的 store 变得可见
+```
+
+Intel SDM 明确规定：WC 类型的存储（包括对 WB 内存执行的 NT store）不享受 TSO 的 store-store 顺序保证，软件必须用 SFENCE 或 MFENCE 给它们定序。两个易混淆的细节：
+
+- **对纯 WB 存储，SFENCE 是冗余的。** TSO 本来就保证 store→store 顺序，WB 存储之间加 SFENCE 不改变语义（也无害）。SFENCE 的必要性完全来自 NT/WC 存储这条 TSO 管不到的路径。
+- **"全局可见"不等于"写进 DRAM 颗粒"。** 排空的终点是一致性点（通常是 home agent / 内存控制器），数据可能还停在内存控制器的写队列 (WPQ) 里，但此时对所有观察者已经可见——对排序目的来说足够。
+
+性能上 SFENCE 不贵：它不冲刷流水线，只是等待排空，代价取决于当时积压的存储数量，通常几个到几十个周期——"每次 NT 批量写完补一条 SFENCE"是完全付得起的常规写法。
 
 #### 1.8.3 硬件实现
 
@@ -1601,7 +1747,81 @@ NUMA 比率:    1.5x - 2.0x
 - 锁/信号量流量
 - IO 流量 (远端 PCIe 设备 DMA 到远端内存)
 
-### 2.8 Snoop 模式
+### 2.8 片上互联拓扑：Mesh 与 Tile
+
+§1.5.5 的互联拓扑列从 Sapphire Rapids 起标注 "Mesh/Tile"。两者不是二选一，而是两个层面的描述：**Mesh 描述逻辑拓扑，Tile 描述物理实现**——逻辑上仍然是 Mesh，物理上把 Mesh 拆到了多个 die 上。一致性模型、寻址方式、CHA 分布式 LLC 都不变，变的是 mesh 链路有一部分要跨越 die 边界。
+
+**Tile 拓扑结构：**
+
+处理器被拆成多个小 die (tile)，tile 之间用 **EMIB (Embedded Multi-die Interconnect Bridge，嵌入式多芯片互联桥)** 连接——嵌在封装基板里的硅桥，在相邻 die 边缘之间提供高密度、短距离的 die-to-die 链路。每个 tile 内部有自己的局部 mesh，多个 tile 的 mesh 在边缘处经 EMIB 链路缝合起来，构成一个更大的逻辑 mesh：
+
+```
+单 die Mesh (Skylake-SP / Ice Lake-SP):
+┌─────────────────────────┐
+│  C─C─C─C─C              │
+│  │ │ │ │ │  一颗 die     │
+│  C─C─C─C─C  跳数代价均匀 │
+│  │ │ │ │ │              │
+│  C─C─C─C─C              │
+└─────────────────────────┘
+
+Tile 化 (以 Granite Rapids 为例):
+┌──────────┐  EMIB  ┌──────────┐  EMIB  ┌──────────┐
+│  Tile 0  │◄──────►│  Tile 1  │◄──────►│  Tile 2  │
+│ 局部mesh │  链路   │ 局部mesh │  链路   │ 局部mesh │
+│ 核+L3切片│        │ 核+L3切片│        │ 核+L3切片│
+│ +iMC     │        │ +iMC     │        │ +iMC     │
+└──────────┘        └──────────┘        └──────────┘
+          另有 I/O tile (UPI / PCIe / CXL)
+```
+
+**与单 die Mesh 的对比：**
+
+| 维度 | 单 die Mesh (SKX/ICX) | Mesh/Tile (SPR/EMR/GNR) |
+|------|----------------------|--------------------------|
+| 物理形态 | 一颗 die | 2~4 个 tile + EMIB 桥 |
+| 跳数代价 | 基本均匀 | tile 内跳便宜，**跨 tile 跳贵** |
+| L3 切片延迟 | 较均匀 | 本地 tile 快，远端 tile 有额外延迟台阶 |
+| 扩展上限 | 受光罩极限 (~858mm²) 约束 | 加 tile 即可继续扩核 |
+| 工艺 | 整颗 die 同一工艺 | 可混搭 (计算 tile 先进工艺 + I/O tile 成熟工艺) |
+| 良率 | 大 die 良率低 | 小 die 良率高 |
+
+**各代形态：**
+
+| 代次 | Tile 配置 | 说明 |
+|------|----------|------|
+| Sapphire Rapids | 4 tile | 每 tile 15 个 Golden Cove 核 (共 60)、UPI 链路与 2 个 DDR5 通道 (4×2=8 通道)，EMIB 连接；Intel 服务器首次量产 MCM |
+| Emerald Rapids | 2 tile | 每 tile 最多 32 核 (共 64)，两 tile 之间 3 座 EMIB 桥；从 4 tile 减到 2 tile 是明确的延迟优化——跨 tile 边界更少 |
+| Granite Rapids | 3 计算 tile + I/O tile | 计算 tile 用 Intel 3 工艺，每 tile 最多约 44 个 Redwood Cove 核，内含核心、L3 切片、DDR5 内存控制器 (三 tile 合计 12 通道)；I/O tile 用 Intel 7 工艺，承载 UPI/PCIe/CXL 接口；mesh 直接跨 EMIB 延伸，全片仍是一个逻辑 mesh |
+| Sierra Forest | tile 化 (E-core) | Xeon 6 E-core 版本，同样采用 tile 架构 |
+
+**对性能分析的影响：**
+
+1. **L3 延迟不再均匀：** 访问本 tile 的 CHA 切片与跨 tile 的切片，延迟有明显台阶；§12.4 中"L3 命中 (远端切片)"一档在 tile 化平台上还要叠加跨 tile 的分量。
+2. **`pcm --die` 有了真实用途：** 单 die 时代该选项意义不大，tile 化之后按 die 聚合能看出各 tile 负载是否均衡。
+3. **访存和 IO 也有 tile 局部性：** iMC 分布在计算 tile 上，UPI/PCIe 集中在 I/O tile 或特定 tile——设备 DMA 数据落到"远端" tile 的内存时，路径上多一次 tile 穿越。这与 NUMA 局部性是叠加关系：先保证 socket 局部，再谈 tile 局部。
+4. **SNC 的天然分区基础：** tile 边界为 Sub-NUMA Clustering 提供物理分区依据，SNC 域与 tile 结构对应后本地访问比例可进一步改善。
+
+> **一句话总结：** Mesh 回答"逻辑上怎么连"，Tile 回答"物理上怎么造"；Intel 用 EMIB 把 mesh 延伸到多 die 上，保住了软件模型的连续性，代价是跳数代价从均匀变成"本地便宜、跨界贵"——性能分析时要多一层 tile 局部性视角。
+
+#### IIO 与 IO tile 不是一一对应
+
+容易误以为"一个 IIO stack = 一块 IO die"，但两者是不同层面的概念：**IIO stack 是功能单元**（一组 PCIe root port + IRP + M2PCIe + DMAR 引擎，见 §3.4/§5.7.2），**IO tile 是物理 chiplet**，不存在 1:1 对应：
+
+- **GNR 之前的平台 (SKX/ICX/SPR/EMR)：** 没有独立的 IO-only tile——IIO/root port 与计算单元在同一颗 die 上。其中 SKX/ICX 是单颗 die，IIO stack 只是 die 上的功能区域；SPR (4 tile)、EMR (2 tile) 虽是多 die，但每个 tile 都是"计算 + UPI + iMC + IIO"混合体，同样没有专门的 IO tile；
+- **tile 化平台 (GNR/SRF)：** 首次出现独立 IO tile 但数量很少——GNR 为 2 个 IO tile (Intel 7)，**每个 IO tile 容纳一组多 lane 的 PCIe root complex（多个 root port 组）**，而不是每 IIO 一块 tile。计算 tile (Intel 3) 放核、L3、DDR5 内存控制器；IO tile 放 PCIe/UPI/CXL/加速器。
+
+```
+GNR 封装 (3 计算 tile + 2 IO tile, EMIB 连接):
+  计算 tile ×3 (Intel 3):  核 + L3 + iMC (内存控制器在计算 tile 上)
+  IO tile ×2  (Intel 7):   PCIe root complex (多 root port) + UPI + CXL + 加速器
+```
+
+> **与 AMD IOD 的对照：** AMD EPYC 把内存控制器 + PCIe + Infinity Fabric 都集中在一颗 IOD 上；Intel GNR 的 IO tile 只放 PCIe/UPI/CXL，**内存控制器在计算 tile 上**——同样用 "IO die/tile" 这个词，两家的划分方式并不相同。
+
+一句话：IIO 与物理 die 的关系是"少量 IO tile、每个容纳多个 IIO/root port 组"；GNR 之前的平台（无论单 die 还是多 tile）都没有专门的 IO tile。
+
+### 2.9 Snoop 模式
 
 | 模式 | 原理 | 延迟 | UPI 带宽消耗 | 适用场景 |
 |------|------|------|-------------|---------|
@@ -1610,7 +1830,7 @@ NUMA 比率:    1.5x - 2.0x
 | **Directory-Based** | Home Agent 维护目录追踪缓存副本位置 | 稍高 | **低** | 4路+, 高核数 |
 | **HitME Cache** (SPR+) | 缓存目录状态以减少重复目录查找 | 低 | 低 | 热点行访问 |
 
-### 2.9 CXL (Compute Express Link)
+### 2.10 CXL (Compute Express Link)
 
 CXL 基于 PCIe 物理层，添加三个协议层：
 
@@ -1735,7 +1955,7 @@ Gen5 x16: 32.0 × (128/130) / 8 × 16 ≈ 63 GB/s (单向)
 
 PCIe 使用**基于信用的流量控制**防止缓冲区溢出：
 
-**6 种信用池 (每 VC)：**
+**6 种信用池 (每 VC，VC 概念见 §3.6)：**
 
 | 信用类型 | 缩写 | 单位 |
 |---------|------|------|
@@ -1757,7 +1977,46 @@ PCIe 使用**基于信用的流量控制**防止缓冲区溢出：
 - 高带宽设备（GPU, NVMe 阵列）需要大信用缓冲区
 - credit stall 可在 PCM IIO 计数器中观察到
 
-### 3.6 MSI/MSI-X 中断
+### 3.6 TC 与 VC — PCIe 的 QoS 机制
+
+**一句话区分：**
+
+- **TC (Traffic Class，流量类别)：** TLP 头部里的一个 3 位**标签字段**，给事务打 QoS 分类——"这个包属于哪个服务等级"
+- **VC (Virtual Channel，虚拟通道)：** 设备内部一套**真实的独立队列资源**（独立缓冲 + 独立信用池 + 独立仲裁）——"这个包排哪条队"
+
+TC 是包上的标签，VC 是设备里的队列，两者靠 **TC/VC 映射**关联。用网络类比：TC ≈ DSCP/802.1p（包标记），VC ≈ 交换机出口队列。
+
+| | TC | VC |
+|---|---|---|
+| 本质 | TLP 头 DW0 的 3 位字段 | 设备内的缓冲队列资源 |
+| 数量 | TC0–TC7（TC0 强制支持） | VC0–VC7（VC0 强制支持） |
+| 作用域 | 端到端，全程不改值 | 逐跳的，每个设备各自独立 |
+| 角色 | 分类"包属于哪个服务等级" | 提供"包排哪条队" |
+| 配置方 | 请求方发包时填写 | 每设备的 TC/VC 映射寄存器 + VC Capability 结构 |
+
+**TC 侧：** TC 字段（TLP 头 DW0 bits [14:12]）由请求方在发 TLP 时设定，穿越 switch、root port 全程不被修改。排序规则按 TC 界定：同一 TC 的 TLP 遵守 PCIe 排序表，**不同 TC 之间没有任何顺序保证**——这为高优先级流量插队留了合法性空间。
+
+**VC 侧：** 每个 VC 各有一套独立的 PH/PD/NPH/NPD/CplH/CplD 信用池（§3.5 表中"每 VC"即此意）——启用 N 个 VC 意味着 N×6 套信用池和 N 份缓冲资源。多个 VC 同时有货要发时，出口由 VC 仲裁器决定谁先走（可配严格优先级或轮询）。VC1–VC7 通过扩展配置空间的 VC Capability 结构（扩展能力 ID 0x0002）使能和管理。
+
+**TC/VC 映射（最容易误解的点）：**
+
+```
+TLP (TC=3) ──► Switch 端口: 按自己的映射 TC3→VC1 ──► VC1 队列 ──► 出口仲裁 ──► 发出
+     │
+     └──────► 端点设备: 按它自己的映射 TC3→VC0 ──► VC0 队列
+```
+
+- 映射寄存器是**逐组件**的：每个设备按自己的 TC/VC mapping bitmap 把入站 TLP 的 TC 翻译成本地 VC，**沿途各跳的映射可以不同**；
+- 多对一：多个 TC 可以映射到同一个 VC；
+- 硬规则：**TC0 必须映射到 VC0**，不可更改——保证默认流量在任何设备上永远有队可排。
+
+准确的说法是：**TC 是端到端的标签，VC 是逐跳的资源**。包上的 TC 值不变，变的是每一跳给它分配的队列。
+
+**设计目的与现实：** 设计目的是 QoS——让等时流量（当年的设想是实时音视频）走独立 VC，保留专属缓冲、配优先级仲裁，不被卡在信用上的大宗流量堵住。但现实是**实际部署几乎清一色只用 TC0/VC0**，PCIe QoS 从未真正铺开：缓冲管理复杂、真正需要它的应用少，隔离类需求大多用别的机制（SR-IOV §3.10、独立 root port）解决。
+
+> **防混淆提示：** §14.4.3 中 Mesh 互联的 AD/AK/BL/IV 也叫"虚拟通道"，但那是为了**协议死锁避免**（不同消息类型物理隔离），与 PCIe VC 的 QoS 目的完全不同，只是重名。
+
+### 3.7 MSI/MSI-X 中断
 
 | 特性 | MSI | MSI-X |
 |------|-----|-------|
@@ -1774,7 +2033,89 @@ PCIe 使用**基于信用的流量控制**防止缓冲区溢出：
   → 中断送达目标 CPU LAPIC
 ```
 
-### 3.7 AER (Advanced Error Reporting)
+**为什么不需要 I/O APIC：** MSI/MSI-X 路径与 I/O APIC 完全无关——地址选 LAPIC、数据带 vector，路由信息直接存在设备里（由 OS 编程），不需要集中式重定向表。两条路径对比：
+
+```
+传统 pin 中断 (INTx):
+  设备中断引脚 → I/O APIC 收 pin → 查重定向表 (pin → vector + 目标 LAPIC)
+    → I/O APIC 发中断消息给目标 LAPIC
+
+MSI/MSI-X:
+  设备发 Memory Write TLP → 地址 = 0xFEExxxxx (编码目标 LAPIC ID)
+                           → 数据 = vector + 投递模式
+    → 直达目标 LAPIC，I/O APIC 不参与
+```
+
+| 痛点 (pin/IOAPIC 路线) | MSI/MSI-X 的解法 |
+|---|---|
+| PCI 只有 INTA–D 四根 pin，设备共享 → IRQ 冲突、level 触发歧义 | 无 pin，中断是消息；MSI-X 每设备最多 2048 向量，天然 edge 触发 |
+| I/O APIC 重定向表容量小 (典型 24 项)，全局瓶颈 | 路由信息直接写在设备自己的 MSI-X 表里，无集中瓶颈 |
+| 一个设备的中断只能固定打到一个 CPU | 每个向量的地址独立可编程 → **逐向量亲和性**，网卡每队列一向量分散到不同核 |
+| 改投递目标要改 I/O APIC 表项 | OS 改写设备 MSI-X 表即可 (`/proc/irq/N/smp_affinity` 背后就是重写该向量的地址字段) |
+
+**两个易混淆的细节：**
+
+- **PCIe 上的 INTx 其实也是消息。** PCIe 没有物理中断引脚，INTx 用 `Assert_INTx/Deassert_INTx` 消息模拟——严格说 PCIe 上所有中断都在带内走 TLP。区别在**终点**：INTx 消息终结在 Root Complex/PCH 里的 I/O APIC 逻辑再转给 LAPIC；MSI/MSI-X 的写直达 LAPIC。
+- **中断重映射不改变这个结构。** VT-d 中断重映射启用后 (§4.5)，MSI 地址/数据变为 remappable 格式——写操作携带中断重映射表索引，由 IOMMU 翻译成真实目标与 vector（防设备伪造中断），但路径仍是设备 → IOMMU 翻译 → LAPIC，I/O APIC 依旧不在路径上。
+
+**I/O APIC 现状：** 只剩兜底场景——只有 pin 的传统设备（串口、电源按钮、部分嵌入式控制器）、MSI 被禁用时的 INTx 回退、虚拟化中模拟传统中断。现代高速设备（网卡、NVMe、GPU）清一色 MSI-X。Linux 上可直接验证：`/proc/interrupts` 里 MSI-X 中断显示 `PCI-MSI` + edge 触发（如 `enp1s0-rx-0`），传统中断显示 `IO-APIC` + level 触发。
+
+#### MSI/MSI-X 消息格式 (x86)
+
+"中断"就是一笔 4 字节内存写，地址与数据的格式由 x86 定义（MSI 与 MSI-X 完全相同，MSI-X 只是给每个向量独立一组）：
+
+**Message Address (32 位)：**
+
+```
+ 31          20 19        12 11 10 9      4 3     2 1   0
+┌──────────────┬────────────┬──┬──┬────────┬────────┬──────┐
+│ 0xFEE (固定)  │ Dest ID    │RH│DM│  Rsvd  │Ext Dest│ Rsvd │
+│ 中断消息前缀   │ APIC ID[7:0]│  │  │        │ID[9:8] │      │
+└──────────────┴────────────┴──┴──┴────────┴────────┴──────┘
+```
+
+| 位域 | 含义 |
+|------|------|
+| [31:20] | 固定 0xFEE，标识这是中断消息（与 LAPIC 寄存器区 0xFEE00000–0xFEEFFFFF 吻合） |
+| [19:12] | Destination ID——目标 LAPIC 的 APIC ID 低 8 位 |
+| [11] | RH (Redirection Hint)：是否允许重定向（如最低优先级投递） |
+| [10] | DM (Destination Mode)：0=物理模式 (Dest ID 即 APIC ID)，1=逻辑模式；**RH=0 时此位被忽略** |
+| [9:4] | 保留 |
+| [3:2] | Extended Destination ID——APIC ID [9:8]，支持 x2APIC 的 10 位 APIC ID；ID 更长则必须走中断重映射 |
+| [1:0] | 保留（地址 DW 对齐） |
+
+实践中 OS 几乎总是用 RH=0 / DM=0（物理模式，精确指定目标核）。
+
+**Message Data (32 位，仅低 16 位使用)：**
+
+| 位域 | 含义 |
+|------|------|
+| [7:0] | Vector——中断向量号 |
+| [10:8] | Delivery Mode：000=Fixed, 001=Lowest Priority, 100=NMI, 101=INIT, 111=ExtINT 等 |
+| [11] | 保留 |
+| [12] | Level（MSI 固定写 Assert） |
+| [13] | Trigger Mode：MSI/MSI-X 恒为 0（edge 触发） |
+| [15:14] | 保留 |
+
+字段语义与 LAPIC 的 ICR (Interrupt Command Register) 一一对应——MSI 写本质上是"远程递送一条中断命令"。
+
+**MSI-X 表条目（每向量 16 字节）：**
+
+MSI-X 把每个向量的消息参数存放在 BAR 映射内存中的表里（表位置由 MSI-X Capability 指明）：
+
+```
+┌──────────────────┬──────────────────┬──────────────────┬──────────────────┐
+│ Message Addr Low │ Message Addr High│ Message Data     │ Vector Control   │
+│ (DW0)            │ (DW1)            │ (DW2)            │ (DW3)            │
+└──────────────────┴──────────────────┴──────────────────┴──────────────────┘
+                                     Vector Control bit 0 = 屏蔽该向量
+```
+
+- MSI-X 无条件支持 64 位地址（MSI 的 64 位是可选能力）
+- Vector Control 提供**逐向量屏蔽**，配合 PBA (Pending Bit Array) 记录屏蔽期间到达的中断
+- OS 调整中断亲和性，实质就是重写对应条目的 Address 中的 Dest ID
+
+### 3.8 AER (Advanced Error Reporting)
 
 | 错误类别 | 类型 | 示例 |
 |---------|------|------|
@@ -1782,20 +2123,66 @@ PCIe 使用**基于信用的流量控制**防止缓冲区溢出：
 | **不可纠正 - 非致命** | 数据丢失但链路可用 | Completion Timeout, Poisoned TLP, UR, ECRC Error |
 | **不可纠正 - 致命** | 链路不可用 | Malformed TLP, Flow Control Protocol Error, Surprise Down |
 
-### 3.8 ACS (Access Control Services)
+### 3.9 ACS (Access Control Services)
+
+**为什么需要 ACS：P2P 绕过 IOMMU。** IOMMU 位于 Root Complex，只能检查"经过 RC"的事务。但 PCIe switch 能在两个下游端口之间**直接路由 P2P 事务**——不上行、不经过 IOMMU，形成隔离漏洞：
+
+```
+             ┌───────── Root Complex ─────────┐
+             │         (IOMMU 在此)            │
+             └───────────────┬─────────────────┘
+                             │
+                      ┌──────┴──────┐
+                      │ PCIe Switch │
+                      └──┬───────┬──┘
+                         │       │
+                     设备 A     设备 B
+                   (VM1 直通) (VM2 直通)
+
+无 ACS: A→B 的 P2P 在 switch 内部直接交换，不经 IOMMU → 跨 VM 访问成为可能
+有 ACS: P2P 被强制绕行上游 RC，接受 IOMMU 检查（或直接阻断）
+```
 
 ACS 控制点对点流量路由，对虚拟化安全至关重要：
 
 | 控制位 | 功能 |
 |--------|------|
-| **Source Validation (SV)** | 阻止欺骗的 Requester ID |
-| **Translation Blocking (TB)** | 阻止 ATS 翻译的请求绕过 IOMMU |
-| **P2P Request Redirect (RR)** | 将 P2P 请求重定向上行到 Root Complex |
-| **P2P Completion Redirect (CR)** | 将 P2P 完成重定向上行 |
+| **Source Validation (SV)** | 校验到达请求的 Requester ID 确属本端口下方设备，防 Requester ID 欺骗 |
+| **Translation Blocking (TB)** | 阻止携带 ATS 预翻译地址的请求，防设备用已翻译地址绕过 IOMMU 翻译 |
+| **P2P Request Redirect (RR)** | 将 P2P 请求（目标为其他下游端口）重定向上行到 Root Complex / IOMMU |
+| **P2P Completion Redirect (CR)** | P2P 完成包同样重定向上行 |
+| **Upstream Forwarding (UF)** | 配合重定向机制控制请求向上游端口转发（较少配置） |
+| **P2P Egress Control (EC)** | 用 Egress Control Vector 精细控制 P2P 允许到达哪些下游端口 |
+| **Direct Translated P2P (DT)** | 对已翻译 (ATS) 请求放行直接 P2P，覆盖 RR/EC 的限制 |
 
-> **VT-d/VFIO 重要性：** 将 PCIe 设备分配给 VM 时，中间所有 switch/bridge 必须启用 ACS，确保 DMA 始终经过 IOMMU。Linux 检查 "ACS chain" 来确定 IOMMU 组。
+**与 IOMMU 的分工：** ACS 管"设备间 P2P 流量是否必须回到上游路径（从而经过 IOMMU）"，IOMMU 管"DMA 地址如何翻译和保护"，两者配合才构成完整隔离。
 
-### 3.9 SR-IOV (Single Root I/O Virtualization)
+#### ACS 与 Linux IOMMU group（实战关键）
+
+Linux 以 **IOMMU group** 为 VFIO 直通的最小单位——同组设备必须一起直通（或都不直通）。分组规则正是基于 ACS：
+
+- **规则：** 可能不经过 IOMMU 就互相 P2P DMA 的设备，被划进同一组；
+- **ACS 的作用：** 设备到 root 的整条路径都启用了 ACS（RR/CR 强制 P2P 过 IOMMU），内核才知道该端口后的设备彼此隔离，可以拆成独立组——内核用 `pci_acs_enabled()` 检查这条 "ACS chain"；
+- **缺 ACS 的后果：** 无 ACS 的 switch 下挂的所有设备挤进一个大组，无法单独直通——这是消费级主板 GPU 直通的常见拦路虎。
+
+```bash
+# 查看 IOMMU group 划分
+find /sys/kernel/iommu_groups/ -type l | sort -t/ -k5 -n
+
+# 查看各端口 ACS 使能情况 (ACSCtl)
+lspci -vvv | grep -iE "ACSCap|ACSCtl"
+```
+
+> **ACS override 补丁警示：** 社区有非上游内核补丁 `pcie_acs_override=`，靠"假装 ACS"强拆 IOMMU group。直通是方便了，但设备之间可能仍能绕过 IOMMU 互访——牺牲真实隔离保证换便利，生产环境慎用。
+
+#### 安全与 P2P 性能的取舍
+
+RR/CR 强制 P2P 流量绕行 RC，比在 switch 内直接交换多一跳，影响 P2P 带宽与延迟——对 GPUDirect、NVMe↔GPU 这类场景是实际代价（见 §14.4.5 的 `UNC_M2P_*` P2P 事件与 §21.4 GPU P2P 场景）：
+
+- **虚拟化直通场景：** 启用 ACS，隔离优先；
+- **需要高效 P2P 的 HPC/GPU 集群：** 可能要放宽 ACS（接受更低的隔离），保留 switch 内直接 P2P。
+
+### 3.10 SR-IOV (Single Root I/O Virtualization)
 
 ```
 ┌──────────────────────────────┐
@@ -1821,6 +2208,185 @@ ACS 控制点对点流量路由，对虚拟化安全至关重要：
 - MSI-X 中断 → 直接送达 VM vCPU
 ```
 
+#### VF 为什么能有 255 个：ARI
+
+BDF 里的 Function 字段只有 3 位，正常情况下一个设备最多 8 个 function——SR-IOV 靠 **ARI (Alternative Routing-ID Interpretation)** 突破这个限制：把原来 `Device[4:0] + Function[2:0]` 这 8 位**重新解释为一个 8 位 Function 字段**，Device 字段被取消（隐含为 0）：
+
+```
+标准解释:   [ Bus 8位 | Device 5位 | Function 3位 ] → 每设备最多 8 个 function
+ARI 解释:   [ Bus 8位 | Function 8位 ]              → 每设备最多 256 个 function
+```
+
+256 个 function 号中 PF 占 0 号，**1–255 给 VF**——这就是"最大 255 个 VF"的出处。
+
+**VF 的 Routing ID 是计算出来的：** VF 不是天然排在 PF 的 function 1–7 上，其路由 ID 由 SR-IOV Capability 里的两个字段决定：
+
+```
+VF_n 的 Routing ID = PF 的 Routing ID + First VF Offset + (n-1) × VF Stride
+
+First VF Offset: PF 到第一个 VF 的偏移
+VF Stride:       相邻 VF 之间的偏移
+```
+
+ARI 启用时典型配置是 Offset=1、Stride=1，VF 即同一 Device 下的 function 1、2、3……：
+
+```
+PF:    03:00.0
+VF1:   03:00.1
+VF2:   03:00.2
+...
+VF255: 03:00.ff     ← Device 号始终是 00，变的是 8 位 Function
+```
+
+**ARI 的启用条件：** 需要两端配合——① 设备声明 ARI Capability；② **设备上方的下游端口**（root port 或 switch downstream port）在 Device Control 2 寄存器置位 **ARI Forwarding Enable**，桥按 8 位 Function 口径解释经过它的 Requester ID；③ 实际部署中这一步通常由 BIOS/固件在枚举时完成。
+
+**推论：一条 ARI 总线只能挂一个设备。** Device 号字段被取消后，整条总线的 256 个 function 号全部属于这一个 ARI 设备，第二个独立设备无法共存：
+
+```
+ARI 下，总线 03 的 function 空间全部属于 03:00.x 这个设备:
+  03:00.0 ~ 03:00.ff  → function 0 ~ 255
+
+若还想放第二个设备 03:01.0:
+  03:01.0 会被解释成 function 8 (device 位 [7:3] 变成 function 高位)
+  → 与第一个设备的 function 8 直接冲突
+```
+
+对这个结论的两点澄清：
+
+- **是"每总线一个"，不是"每系统一个"：** ARI Forwarding 按下游端口独立配置，switch 拓扑里每个 downstream port 可各挂一个 ARI 设备、各占一条总线，全系统可以有很多 ARI 设备。
+- **8 个 bit 是那一个设备的 function 编号空间，不是"给 SR-IOV 用"：** SR-IOV 只是这个空间的用户；非 SR-IOV 的多 function 设备（某些 GPU/FPGA）同样可以用 ARI 突破 8 function 限制。
+
+这也解释了为什么 SR-IOV 网卡在拓扑上几乎总是点对点接到 root port 或独占一个 switch downstream port；传统多设备总线不启用 ARI，继续按 32 device × 8 function 解释——两种解释按端口各自生效，互不干扰。
+
+**没有 ARI 会怎样：** 3 位 Function 只剩 7 个位置（1–7），每个 PF 最多 7 个 VF。理论上 VF Stride 可设成 ≥8，让 VF 散开到多个 Device 号上（每个占一个 Device 的 function 0），但消耗总线槽位资源、受每总线 32 个 Device 的限制，还要和总线上其他设备抢编号，不是主流做法。
+
+**实战含义：**
+
+- "写 `sriov_numvfs` 只能出 7 个 VF"的经典原因，就是 PF 上方端口的 ARI Forwarding 没使能，function 号被卡回 3 位；
+- `lspci` 里大量 VF 显示为同一 Device 下的 function（`03:00.1` … `03:00.ff`）——看到 function 号超过 7，说明 ARI 已生效。
+
+### 3.11 DMA 事务全路径与性能因素
+
+以**入站 DMA 写**（设备 → 主机内存，如网卡写报文）为主线讲全路径，再讲读路径差异，最后归类性能因素。
+
+#### 入站 DMA 写全路径
+
+```
+[设备 Endpoint]
+  ① 描述符获取 + 数据就绪        (取描述符本身就是一笔 DMA 读)
+  ② 地址翻译: ATS? ATC 命中→直接用; 未命中→发 ATS Translation Request 给 IOMMU
+  ③ 组装 MWr TLP (大于 MPS 拆成多个 TLP)
+        ▼
+[设备侧链路层]
+  ④ 信用检查: Posted Header/Data (PH/PD) 信用够吗? 不够→credit stall 等 UpdateFC
+  ⑤ 加序列号 + LCRC, 物理层发送
+        ▼
+[Switch (可选, 可多级)]
+  ⑥ LCRC 校验 → 按地址路由 → 出口信用再检查 → ACS 检查 (P2P 重定向等, §3.9)
+        ▼
+[Root Port / IIO]
+  ⑦ IOMMU/DMAR (§4.2): Requester ID(BDF) → Root/Context Table (Context Cache 命中加速)
+  ⑧ IOVA→HPA 翻译: IOTLB 命中→快; 未命中→4 级页表遍历 (PWC 缓存中间级, §4.4)
+  ⑨ 权限检查 (R/W)
+        ▼
+[Mesh 互联]
+  ⑩ IRP 作为 IO 一致性代理, 注入 mesh, 路由到该地址归属的 CHA (§5.7.2)
+        ▼
+[CHA (Caching/Home Agent)]
+  ⑪ 查 Snoop Filter/目录: 有没有核的缓存持有这条线?
+  ⑫ 持有→snoop 持有核 (失效/降级); 未持有→继续
+        ▼
+[LLC / DDIO]
+  ⑬ 写是否在 LLC 分配? (DDIO 默认: 入站写分配进 LLC 的有限 way)
+  ⑭ TPH steering tag → 引导放到目标核附近的 LLC 切片/核缓存
+        ▼
+[iMC → DRAM]  (若被 LLC 驱逐或不保留在 LLC)
+  ⑮ WPQ 排队 → DRAM 时序 (tRCD/CL, §2.4) → bank 冲突/刷新
+        ▼
+[写提交, 全局可见]
+  ⑯ Posted 写无完成 TLP; 设备随后写回描述符 + 发 MSI-X 通知 CPU (§3.7)
+```
+
+**关键点展开：**
+
+- **地址翻译的两种形态：** 不开 ATS 时设备发未翻译 IOVA，翻译全压在 IOMMU 上（每笔新页都可能触发 IOTLB 查找/遍历）；开 ATS 后设备用自己的 ATC 缓存 IOVA→HPA，命中就直接发**已翻译**地址，IOMMU 只做快速放行——把翻译延迟挪出数据路径，但 ATC 未命中要发翻译请求、失效时要响应 IOMMU 的 Invalidation（§4.7）。
+- **IOMMU 是入站 DMA 的大头开销：** IOTLB 命中约几周期；未命中触发 4 级页表遍历，每级一次访存（除非 PWC 命中），全未命中可达几百 ns。这就是 DMA 缓冲用 2MB/1GB 大页能显著提速的原因——翻译条目少、IOTLB 覆盖深、遍历级数短（§4.4）。
+- **一致性处理：** DMA 写命中"已被某核缓存"的行时，协议必须 snoop 持有核拿到最新状态/失效它，否则 CPU 缓存里是旧值。Snoop 模式（§2.9）决定这一步的延迟与流量。
+- **DDIO 与 TPH 决定"写去哪儿"：** Intel DDIO 让入站 DMA 写**默认分配进 LLC**（限定的几个 way，可配），CPU 随后读报文命中 L3 而非掉 DRAM——这是网卡/DPDK 场景低延迟的关键。TPH 更进一步：设备在 TLP 里带 steering tag，告诉系统"把数据放到目标核附近的 LLC 切片/核缓存"。
+- **Posted 写没有完成包：** MWr 是 fire-and-forget。"DMA 完成"对软件可见，靠设备**随后写回描述符 + 发 MSI-X** 的顺序保证（相关排序见下文 Relaxed Ordering）。
+
+#### DMA 读路径的差异（tag 在这里）
+
+DMA 读（设备从内存取数据）是 **Non-Posted**，机制不同：
+
+```
+设备发 MRd (Non-Posted) → 每个在途读分配一个 Tag
+  → IOMMU 翻译 → mesh → CHA 一致性查 (读必须拿到最新一致数据)
+  → 从 LLC 命中 或 DRAM 取数
+  → 组 CplD 完成包, 携带原 Requester ID + Tag + 数据
+  → 原路返回 → 设备按 Tag 匹配回收, 若被拆分则重组
+```
+
+**Tag 是读并发的硬上限：** 设备能同时挂起的在途读数受 Tag 位宽限制（8 位=256，PCIe 3.0+ 的 10-bit Tag=1024）。读吞吐 ≈ 在途 Tag 数 × 每读负载 ÷ 读延迟，所以 **Tag 耗尽会停发新读**。不同请求的完成可能乱序回来，一笔读还可能被拆成多个完成（按 RCB 64B/128B 与 MPS 边界拆分），设备只能靠 Tag 匹配重组，不能依赖顺序。
+
+#### credit 与 tag 为何都需要
+
+两者容易被混为"流控"，实为不同层次、正交的机制：
+
+- **Credit = 链路层流控：** 防止**下一跳**缓冲区溢出，回答"这个 TLP 现在能不能发"（逐跳反压，§3.5）；
+- **Tag = 事务层标识：** 让请求方把**回来的完成包对上当初那笔在途请求**，回答"这个完成是哪笔读的"（端到端匹配）。
+
+Credit 管"别溢出"，Tag 管"别对不上号"，谁都替代不了谁：
+
+| | 只有 credit | 只有 tag |
+|---|---|---|
+| 缺的能力 | 无法给每笔事务身份，乱序/拆分的完成对不上号 | 不防缓冲溢出，仍需逐跳反压 |
+
+两种不同的停顿也由此对应：
+
+| | Credit stall | Tag stall |
+|---|---|---|
+| 原因 | 下一跳接收缓冲满 | 请求方 tag 用光，挂不起更多读 |
+| 瓶颈侧 | 接收方 / 网络侧 | 请求方自身跟踪能力 |
+| 解除 | 等接收方归还信用 (UpdateFC) | 等早先的完成回来、释放 tag |
+
+信用充足也可能 tag 用光而卡住（在途读太多、完成回得慢）；tag 充足也可能被信用反压卡住。Tag 位宽有限，顺带成为在途读的并发上限——但那是"标识能力"的副作用，不是缓冲反压；同时请求方还要通告足够的**完成信用 (CplH/CplD)** 保证在途读的完成能流回，两者要匹配但各管各的。
+
+#### 性能因素归类
+
+**A. 流控与并发：** credit（六类信用池，§3.5）、tag（读并发）、设备 DMA 引擎的在途请求深度。
+
+**B. TLP 效率：**
+
+| 因素 | 机制 | 影响 |
+|---|---|---|
+| MPS | 单 TLP 最大负载；写超 MPS 拆多包 | MPS 小→包头开销占比高、TLP 数多（§3.3） |
+| MRRS | 单读请求最大长度；读超 MRRS 拆多个 MRd | MRRS 小→读请求多、Tag 消耗快 |
+| Alignment | 地址对齐到缓存行/负载边界，避免跨 4KB 页、跨 RCB | 未对齐→拆包/完成更多；跨页边界要软件/设备拆分 |
+| RCB | 完成包拆分边界，64B 或 128B | 读跨 RCB→多个完成包，设备重组 |
+| Partial write | 未填满整条 64B 缓存行的写 | 目标行不在 LLC 时 partial 写要先取回该行再合并（read-modify-write），多一次读的延迟与流量；整行写可直接落 |
+
+**C. 地址翻译：** IOTLB 命中/未命中、页表遍历/PWC、Context Cache、ATS/ATC、页大小（大页显著利好 DMA，§4.4）。
+
+**D. 一致性与数据放置：** DDIO（入站写分配进 LLC）、TPH（引导放置）、snoop 模式（§2.9）、No Snoop（Attr 位，省 snoop 但需软件保证该行不在缓存）、Relaxed Ordering / IDO（允许重排提吞吐；描述符/数据顺序靠它保证正确）。
+
+**E. 互联与内存：** mesh 跳数（tile 化后叠加跨 tile 分量，§2.8）、NUMA/UPI（跨 socket DMA 要走 UPI，缓冲应分配在设备本地 NUMA，§2.7）、DRAM 时序/bank 冲突/刷新/WPQ（§2.4）、LLC 放置后 CPU 消费的命中/未命中。
+
+**F. 软件/配置：** 中断合并（降中断开销但加延迟）、MPS/MRRS 配置、IOMMU 模式（passthrough 省翻译但失隔离）、DMA 缓冲对齐与大页。
+
+#### PCM 观测点对照
+
+| 性能因素 | PCM 工具 / 事件 |
+|---|---|
+| Credit stall | IRP `UNC_I_TxR2_*_STALL_CREDIT_CYCLES`（§14.4.5） |
+| IOTLB / 翻译 | `pcm-iio` 的 IOTLB Lookup/Miss、Context/Page Walk Cache（§4.4/§10.2） |
+| 入站带宽 | `pcm-iio`、`UNC_IIO_DATA_REQ_OF_CPU`（§10.2/§14.4.2） |
+| LLC 放置/命中 | `UNC_CHA_LLC_LOOKUP.*`（§1.9.3） |
+| DRAM | `pcm-memory` 的 `UNC_M_CAS_COUNT.RD/WR`（§2.5） |
+| 跨 socket | UPI 带宽（§2.7） |
+
+> **一句话总结：** DMA 的延迟与吞吐由"翻译 (IOTLB/ATS) + 一致性 (snoop/DDIO) + 流控 (credit/tag) + TLP 效率 (MPS/对齐/partial) + 放置 (LLC/TPH/NUMA)"五段共同决定，任何一段成为短板都会拖住整体；写路径是 posted 无回执、靠描述符 + 中断收尾，读路径靠 tag 支撑并发。
+
 ---
 
 ## 第4章 IOMMU (Intel VT-d)
@@ -1833,7 +2399,46 @@ ACS 控制点对点流量路由，对虚拟化安全至关重要：
 | **中断重映射** | 控制设备中断的目标和参数 |
 | **设备隔离** | 阻止设备访问未映射的内存区域 |
 
-### 4.2 DMA 重映射 — 地址翻译结构
+### 4.2 DMAR 单元的物理分布
+
+Intel 平台的 IOMMU 称为 **VT-d**，硬件实体是 **DMAR (DMA Remapping) 单元**。**一个 socket 内有多个 DMAR 单元**，不是整棵 PCIe 树共用一个 IOMMU：
+
+```
+                 ┌──────────────── Socket ────────────────┐
+                 │              Mesh 互联                  │
+                 │  ┌────────┐   ┌────────┐   ┌────────┐  │
+                 │  │ IIO 0  │   │ IIO 1  │   │ IIO 2  │  │
+                 │  │+DMAR 0 │   │+DMAR 1 │   │+DMAR 2 │  │
+                 │  └───┬────┘   └───┬────┘   └───┬────┘  │
+                 └──────┼────────────┼────────────┼───────┘
+                     root ports   root ports   root ports
+                        │            │            │
+                     PCIe 子树0    PCIe 子树1    PCIe 子树2
+```
+
+- **位置：** 每个 DMAR 单元位于 uncore，与所属 IIO stack (§3.4/§5.7.2) 放在一起，坐在 "root port → mesh" 的路径上——入站 DMA 进入 mesh 前先被它翻译。PCIe 树被切成若干子树，**每个 DMAR 单元负责一个 IIO stack 下那棵子树的翻译**；
+- **职责：** 每个单元同时做 DMA 重映射与中断重映射 (§4.5)，各自带独立的 IOTLB / Context Cache / 页表遍历缓存 (§4.4)；
+- **客户端 vs 服务器：** 客户端 Core 通常只有 1–2 个 DMAR 单元（在 System Agent 里）；Xeon SP 才是"每个 IIO stack 一个"的布局。根复合体集成设备（不经 root port 的片内设备）也由某个 DMAR 单元管辖。
+
+**发现机制——ACPI DMAR 表：** 单元数量与设备归属由固件上报，不是写死的：
+
+- DMAR 表里的每条 **DRHD (DMA Remapping Hardware Unit Definition)** 定义一个 DMAR 单元：MMIO 基地址 + **Device Scope**（管辖哪些 root port/设备）；
+- BIOS/UEFI 负责探测重映射硬件并填表，Linux VT-d 驱动解析此表完成初始化。
+
+```bash
+# 每个 DMAR 单元一条，含基地址
+dmesg | grep -i DMAR
+
+# Linux 把每个单元暴露成一个 iommu 设备
+ls /sys/class/iommu/          # dmar0  dmar1  dmar2 ...
+
+# 直接看 ACPI DMAR 表
+sudo acpidump -b && iasl -d dmar.dat
+```
+
+**为什么是多个而不是一个：** 单个 IOMMU 会成为所有 root port DMA 的翻译瓶颈；多单元把翻译负载摊开（每单元各有自己的翻译缓存）、把翻译放在 DMA 入口处（root port 旁），避免把全树 DMA 引到一个集中点。这也是 `pcm-iio` 的 IOMMU 指标 (§10.2) 按单元统计的原因。
+
+### 4.3 DMA 重映射 — 地址翻译结构
 
 #### Legacy 模式：
 
@@ -1870,7 +2475,7 @@ Root Table
 | TM | Transient Mapping 提示 |
 | 地址 | 下一级页表或翻译后物理帧的地址 |
 
-### 4.3 IOTLB 性能影响
+### 4.4 IOTLB 性能影响
 
 | 场景 | 延迟影响 |
 |------|---------|
@@ -1886,7 +2491,7 @@ Context Cache   — 上下文缓存命中
 Page Walk Cache — 页表遍历缓存命中
 ```
 
-### 4.4 中断重映射
+### 4.5 中断重映射
 
 ```
 无中断重映射:
@@ -1908,7 +2513,65 @@ Page Walk Cache — 页表遍历缓存命中
 **安全性：** 防止设备中断欺骗
 **灵活性：** OS 可通过修改 IRTE 重定向中断到不同 CPU，无需重新编程设备
 
-### 4.5 PASID (Process Address Space ID)
+#### Posted Interrupt（虚拟化中断直投）
+
+中断重映射在虚拟化下有个关键形态。传统路径上，直通设备（VFIO/SR-IOV）的中断到达 vCPU 要：中断到达 → **VM exit** → hypervisor 截获 → 注入虚拟中断 → guest 处理。对高频中断（直通网卡高包率）这个 exit/注入开销巨大。**Posted Interrupt (PI) 让中断免 VM exit 直投正在运行的 vCPU。**
+
+**关键数据结构：**
+
+- **Posted Interrupt Descriptor (PID)：** 每 vCPU 一个、内存中 64 字节结构——
+  - **PIR (Posted Interrupt Request)：** 256 位 bitmap，每 bit 对应一个中断向量；
+  - **ON (Outstanding Notification)：** 标记有通知待处理；
+  - **SN (Suppress Notification)：** 抑制通知（vCPU 被调出时用）；
+  - **NV (Notification Vector)：** 通知中断的向量号；
+  - **NDST (Notification Destination)：** vCPU 当前所在物理核的 APIC ID。
+- **Posted 格式 IRTE：** 中断重映射表项设为 Posted Format（Interrupt Mode=1），不再存"目标 LAPIC + 向量"，改存 **PID 地址 + 虚拟向量**。
+
+**投递流程：**
+
+```
+设备发 MSI-X → IOMMU 中断重映射查 IRTE → 发现 Posted 格式
+  → 在目标 vCPU 的 PID/PIR 里置该向量的位
+  → vCPU 在运行 (SN 未置) → 发通知中断 (NV 向量的 IPI) 给它所在物理核 (NDST)
+  → CPU 硬件处理通知向量 (见下"为什么不 VM exit")
+  → guest 看到中断挂起并处理 —— 全程无 VM exit
+```
+
+**为什么不 VM exit（机制核心）：** 通知中断确实送到了物理 CPU，差别在 CPU 于 guest 模式收到这个**特定向量**后怎么处理。VMCS 里有两处关键设置——**Posted-interrupt notification vector**（指定哪个向量是通知向量）和 **Process posted interrupts**（次级执行控制位）。CPU 在 guest 模式收到外部中断时：
+
+```
+收到外部中断
+  ├─ 向量 == 通知向量 且 Process posted interrupts 已开
+  │     → 不走普通外部中断 exit, 硬件执行 Posted-Interrupt Processing:
+  │        ① 读 PID (VMCS 的 descriptor address 字段指向)
+  │        ② PIR 置位的向量搬进 guest 的 virtual-APIC 页 (虚拟 IRR)
+  │        ③ 清 PIR / ON 位
+  │     → 接着 Virtual-Interrupt Delivery 把挂起的虚拟中断投给 guest (也是硬件)
+  │     ⇒ 全程无 VMM 参与
+  └─ 否则
+        → external-interrupt exiting=1 → 正常 VM exit 给 hypervisor
+```
+
+| | 普通直通中断 | Posted Interrupt 通知 |
+|---|---|---|
+| 中断向量 | 普通向量 | VMCS 专门指定的通知向量 |
+| guest 模式下收到 | 外部中断 VM exit → 进 hypervisor | 命中通知向量 → Posted-Interrupt Processing |
+| 谁来处理 | hypervisor 软件 | CPU 硬件自动 |
+| 处理方式 | exit 后注入虚拟中断 | 硬件 PIR→vIRR + Virtual-Interrupt Delivery |
+| 是否 VM exit | 有 | 无（全程不进 VMM） |
+
+这里 **Posted-Interrupt Processing**（识别通知向量、合并 PIR→vIRR）与 **Virtual-Interrupt Delivery**（免 exit 投递虚拟中断）是 APIC-v 的两个协同特性，整条链由 CPU 硬件走完——这才是"不 VM exit"的真正原因。注意不是"APIC-v 配置的中断都自动处理"，而是**专门的通知向量 + Posted-Interrupt Processing 机制**让 CPU"自己消化"。
+
+**两种情形：**
+
+- **vCPU 在运行：** post + 通知，硬件合并 PIR 进 vIRR，guest 直接处理，**无 VM exit**；
+- **vCPU 被调出：** SN 置位抑制通知（或通知落在 root 模式），KVM 记为挂起、待 vCPU 调度回来再注入——此路径经过 hypervisor。
+
+**前提：** CPU 支持 VT-x Posted Interrupt Processing（属 APIC-v）；VT-d 支持 Posted Interrupt（ECAP 寄存器 bit 59）；启用中断重映射；hypervisor（KVM/Xen）支持。
+
+**收益：** 直通网卡等高频中断场景免去每中断的 exit/注入开销，显著降延迟与 CPU 开销；与 SR-IOV（§3.10）、MSI-X（§3.7）共同构成高性能直通 IO 的基础。
+
+### 4.6 PASID (Process Address Space ID)
 
 PASID 使每个设备支持多个独立地址空间：
 
@@ -1924,7 +2587,7 @@ PASID 使每个设备支持多个独立地址空间：
 - 无需 pin 页面或预映射 DMA 缓冲区
 - 页缺失时通过 PRI (Page Request Interface) 实现 I/O 按需分页
 
-### 4.6 ATS (Address Translation Services)
+### 4.7 ATS (Address Translation Services)
 
 ```
 1. 设备发送 ATS Translation Request → IOMMU
@@ -3278,7 +3941,7 @@ UNC_<BOX>_<功能>_<细化>_<方向>_<后缀>
 
 #### 14.4.3 Mesh 虚拟通道 (VC) — 理解 AD/AK/BL/IV
 
-Intel Mesh/Ring 互联使用多个虚拟通道隔离不同流量类型，避免协议死锁：
+Intel Mesh/Ring 互联使用多个虚拟通道隔离不同流量类型，避免协议死锁（注意与 PCIe 的 VC 区分，后者是 QoS 机制，见 §3.6）：
 
 | 通道 | 全称 | 用途 |
 |------|------|------|
@@ -3740,7 +4403,7 @@ stream_c -DSTREAM_ARRAY_SIZE=200000000 -DNTIMES=20
 
 **解决方案：**
 - 算法优化减少内存访问 (缓存分块)
-- Non-Temporal Stores 避免无用的缓存行填充
+- Non-Temporal Stores 避免无用的缓存行填充 (原理见 §1.6)
 - 利用 AVX-512 提高每次访问的数据处理效率
 - 考虑 CXL 内存扩展带宽
 
@@ -4183,8 +4846,8 @@ PCM_PRINT_TOPOLOGY=1 sudo pcm 1 -i=1
 
 ---
 
-> **手册版本：** v3.1 (修正解码宽度、执行端口分工、存储带宽、UPI 速率等事实性错误；新增 §1.14 流水线组件功能详解与框图审计注)
-> **最后更新：** 2026-11-08
+> **手册版本：** v3.13 (全文正确性评审：修正 §2.8 IIO/IO tile 小节将 SPR/EMR 误标为单 die——实为 SPR 4-tile、EMR 2-tile MCM，仅 SKX/ICX 单 die；交叉引用与其余事实表核验无误)
+> **最后更新：** 2026-11-09
 > **基于 PCM 版本：** 202604+
 > **参考资料：**
 > - Intel PCM GitHub: https://github.com/intel/pcm
