@@ -490,6 +490,20 @@ OFFCORE_RESPONSE                         — 跨核/内存访问 (高度可配�
 - 转发延迟：~4-5 周期
 - 跨越存储边界或存储窄于加载时转发失败
 
+**转发矩阵（典型情形）：**
+
+| 存储 | 加载 | 关系 | 结果 |
+|------|------|------|------|
+| 8B | 8B / 4B / 2B / 1B | 加载是存储的子集、对齐 | ✓ 转发 |
+| 4B | 4B 或更窄 | 对齐 | ✓ 转发 |
+| 4B | 8B | 存储窄于加载 | ✗ 失败 |
+| 任意 | 加载跨越存储范围 | 部分重叠 / 跨边界 | ✗ 失败 |
+| 拆分存储 (跨 2 个 SB 条目) | 任意 | 存储本身不连续 | ✗ 失败 |
+
+**失败代价：** 转发失败时，load 必须等 store drain 进 L1d 再从缓存重读，延迟从 ~4-5 周期跳到十几甚至更多周期，还多占 SB/LB 条目。可用 PEBS load latency 采样识别（失败转发的延迟字段显著偏高），相关事件以 `pmu-query` 查 `LD_BLOCKS*`。
+
+**实战常见场景：** 结构体字段先写 4 字节再读 8 字节、非对齐访问跨缓存行、向量化后 store 被拆分，都会触发转发失败。优化热路径时确保同一地址的"存储/加载宽度一致且对齐"。
+
 #### Line Fill Buffer (LFB) / MSHR
 
 | 代次 | 条目数 |
@@ -1539,6 +1553,32 @@ echo 0 > /sys/devices/system/cpu/cpu<sibling>/online
 5. **加载侧带宽口径：** 框图 LB 旁 "32B/cycle" 与 Skylake L1d 2×64B/cycle 加载峰值不一致，应理解为单返回路径口径或绘图简化。
 6. **存储带宽口径：** Skylake 峰值存储为每周期 1 笔 256-bit (32B)，而非 64B；Ice Lake 起为每周期 2 笔存储数据操作 (§1.5.2 已同步更正)。
 
+### 1.15 硬件预取器 (Hardware Prefetchers)
+
+缓存未命中代价巨大（L3 ~50 周期、DRAM ~200+ 周期），硬件会主动把预测将被使用的数据提前取进缓存——这就是预取器。预取器是内存带宽与 PCM 读数里的"隐藏变量"：`pcm-memory` 看到的流量里有相当一部分是预取而非需求访问，不懂它会误判。
+
+**各级预取器：**
+
+| 预取器 | 位置 | 触发模式 |
+|--------|------|---------|
+| **L1D (DCU) Streamer** | L1 数据缓存 | 顺序升/降地址流 |
+| **L1D (DCU) IP Prefetcher** | L1 数据缓存 | 按 load 指令 (IP) 跟踪固定步长 (stride) 模式 |
+| **L1D (DCU) Next-Line** | L1 数据缓存 | 预取当前行的相邻下一行 |
+| **L2 Streamer** | L2 | 顺序流，预取进 L2 |
+| **L2 Adjacency (Spatial)** | L2 | 区域内相邻空间预取 |
+| **LLC Prefetcher** | L3/LLC | 可直接预取进 LLC（可跳过 MLC） |
+
+四个 L1/L2 预取器（DCU IP、DCU next-line、L2 streamer、L2 adjacency）由 **MSR 0x1A4** 的若干位分别控制（置 1 关闭，具体位序以 SDM Vol.4 为准）；**LLC 预取器不在 0x1A4 里**，服务器平台通常经 BIOS 开关（如 4th Gen Xeon 有独立的 Hardware LLC Prefetch 特性）。E-core 的预取器控制分布在 0x1A4 与 0x1320/0x1321。
+
+**为什么对性能分析重要：**
+
+- **预取占用内存带宽：** 流式负载触发大量预取，`pcm-memory` 的 READ/WRITE 带宽里混着预取流量；需求带宽不高但总带宽打满时，先想到预取。
+- **预取污染缓存：** 错误预取会驱逐有用行，反而抬高需求未命中率。
+- **区分需求与预取：** 用事件拆开——`MEM_LOAD_RETIRED.*` 只统计需求加载（退休、精确）；`L2_RQSTS` 的 `PF_*` 事件（如 `PF_HIT`/`PF_MISS`，具体名以 `pmu-query` 为准）统计 L2 预取。两者占比能看出多少流量是预取。
+- **何时该关：** 随机访问负载（指针追逐、哈希表）预取几乎无益、只剩污染，关掉预取器反而提速；SPEC 等基准常明确标注预取器配置。
+
+> **实战提示：** 看到"内存带宽高、但 IPC 不低、需求 miss 也不高"，先怀疑预取器在做无用功；用 `L2_RQSTS` 的 `PF_*` 与需求事件对照，必要时经 MSR 0x1A4 关闭预取器对比前后。
+
 ---
 
 ## 第2章 内存子系统架构
@@ -1620,6 +1660,19 @@ echo 0 > /sys/devices/system/cpu/cpu<sibling>/online
 - 双子通道设计将独立通道数翻倍，提高调度灵活性
 - 更多 Bank 和 Bank Group 降低了 Bank 冲突概率
 - 片上 ECC 在数据离开芯片前纠正单比特错误
+
+**新内存形态（DDR5 之外）：**
+
+| 类型 | 全称 | 特点 | 平台 |
+|------|------|------|------|
+| **MCR DIMM** | Multiplexed Channel/Rank | rank 级多路复用翻倍带宽 | SPR/EMR 支持 |
+| **MRDIMM** | MCR 的 JEDEC 标准化版本 | 速率可达 8800+ MT/s | GNR |
+| **HBM** | High Bandwidth Memory | 3D 堆叠、与 CPU 同封装、带宽极高延迟低 | SPR-HBM |
+
+- **MCR/MRDIMM：** 通过 rank 级多路复用（交替访问两个 rank）在不增加通道数的前提下翻倍数据率；MRDIMM 是其 JEDEC 标准化形态，GNR 用它达到 DDR5-8800+。
+- **HBM：** 3D 堆叠 DRAM 与 CPU 同封装，带宽远超 DDR（SPR-HBM 每 socket 可达 ~1 TB/s 量级）、延迟也更低，面向 HPC/AI 等带宽敏感负载。
+
+> **注意：** MCR/MRDIMM 与 HBM 改变了 §2.5 带宽公式的"每通道带宽"前提，用 `pcm-memory` 测量时以平台标称带宽为准。
 
 ### 2.3 内存控制器 (iMC)
 
@@ -1848,7 +1901,47 @@ CXL 基于 PCIe 物理层，添加三个协议层：
 | Type 2 | CXL.io + CXL.cache + CXL.mem | GPU/加速器 (有自己内存且缓存主机内存) |
 | Type 3 | CXL.io + CXL.mem | 内存扩展器/内存池 |
 
-**CXL 与 PCM：** `pcm-memory` 可以监控 CXL.mem/CXL.cache 流量。
+**CXL 版本演进：**
+
+| 版本 | 关键特性 |
+|------|---------|
+| **CXL 1.1** | 基础 .io/.cache/.mem，直连设备 |
+| **CXL 2.0** | **内存池化**（switch 让多主机共享内存池）、热插拔、IDE 加密 |
+| **CXL 3.0** | **多级交换**、增强 fabric 拓扑、反向失效 (back-invalidation)，物理层用 PCIe 6.0 (64 GT/s) |
+
+- **CXL 2.0 内存池化：** CXL switch 把一块内存池动态分配给多个主机，提高内存利用率（打破"每台服务器按峰值配内存"的模式）。
+- **CXL 3.0：** 支持多级交换与更复杂的 fabric 拓扑，引入反向失效在多主机间维护一致性；带宽随 PCIe 6.0 物理层翻倍。
+
+**延迟与带宽：**
+- CXL.mem 附加内存的延迟典型 **~150-250 ns**（高于本地 DRAM 的 ~80-100 ns，见 §12.4），取决于设备与链路。
+- 带宽受底层 PCIe 链路限制（如 Gen5 x16 ~63 GB/s）。
+- 适合**冷数据/容量扩展**，热数据仍应留在本地 DRAM。
+
+**CXL 与 PCM：** `pcm-memory` 可以监控 CXL.mem/CXL.cache 流量（`--nocxl` 可抑制 CXL 输出，见 §9.2）；结合 §12.4 的延迟参考值可判断数据是否被意外放到 CXL 内存。
+
+### 2.11 内存交织与地址哈希
+
+`pcm-memory` 常看到"通道不均衡"，其根源在物理地址如何分布到各通道——这由交织 (interleaving) 方式决定。
+
+**交织粒度：** iMC 的地址解码（§2.3）把物理地址哈希到 channel/rank/die。常见粒度：
+
+| 粒度 | 方式 | 影响 |
+|------|------|------|
+| **细粒度 (如 64B~1KB 可配)** | 相邻缓存行分散到不同通道 | 顺序访问能并行打满所有通道，带宽最大 |
+| **粗粒度 (如 4KB 及以上)** | 一整页集中在一个通道 | 单一流可能只压到少数通道 |
+
+- 细粒度交织让顺序流摊到所有通道，`pcm-memory` 看到各通道负载均衡、总带宽高。
+- 粗粒度交织、或访问模式与哈希共振，会把流量集中到部分通道——表现为"通道不均衡"。
+
+**通道不均衡的成因（对应 §9.4/§20.2）：**
+1. **DIMM 配置不对称：** 各通道容量/rank 不同，或部分通道未插满；
+2. **地址模式与哈希共振：** 特定步长恰好落在同一通道；
+3. **NUMA 局部性：** 数据全分配在一个 socket，另一 socket 的通道闲置（见 §2.6）；
+4. **交织粒度过粗：** 单流无法摊开到多通道。
+
+**判断方法：** 用 `pcm-memory` 看逐通道 READ/WRITE——顺序负载下若部分通道接近打满、其余接近空闲，先查 DIMM 对称性与 NUMA 绑定，再考虑交织配置（BIOS）。
+
+> **与 LLC 切片的关系：** CHA/L3 切片（§1.9.3）同样按地址哈希分布到各切片，交织的思路在内存通道与 LLC 切片上都适用；tile 化后又多一层跨 tile 的分布维度（§2.8）。
 
 ---
 
@@ -1896,6 +1989,18 @@ CXL 基于 PCIe 物理层，添加三个协议层：
 └──────────┴─────────────┴──────────┴──────┴──────┘
 ```
 
+**AtomicOp 细节：** AtomicOp 让设备对目标地址（目标内存或 BAR）直接做原子读-改-写，避免"读-改-写"三步的非原子窗口。三种：
+
+| 操作 | 功能 | 典型用途 |
+|------|------|---------|
+| **FetchAdd** | 原子加，返回旧值 | 计数器、环形队列头尾指针 |
+| **Swap** | 原子交换，返回旧值 | 锁、所有权移交 |
+| **CAS** (Compare-and-Swap) | 比较并交换，返回旧值 | 无锁数据结构 |
+
+- AtomicOp 是 **Non-Posted**，目标用 CplD 返回旧值；
+- 需要目标与路径都支持并使能（AtomicOp Routing Supported/Enabled）；
+- 常见于 NIC/GPU 的 RDMA 场景（远端计数、无锁提交队列），操作数宽度 32/64 位。
+
 ### 3.3 PCIe 带宽计算
 
 | 代次 | 原始速率 | 编码 | 编码开销 | 每通道有效速率 | x16 带宽 (单向) |
@@ -1915,6 +2020,8 @@ Gen5 x16: 32.0 × (128/130) / 8 × 16 ≈ 63 GB/s (单向)
 ```
 
 > **注意：** 实际有效带宽还要减去 TLP/DLLP 开销。对于 64 字节负载，协议开销可达 20-30%，因此更大的 Max Payload Size (256B+) 效率更高。
+
+> **Gen6 的 FLIT 模式：** Gen6 起用 PAM4（4 电平幅度调制，每符号 2 bit）并引入定长 **FLIT (Flow Control Unit)** 传输——不再以可变长 TLP 为重传单位，改用 256B FLIT（含 TLP + DLP + CRC + FEC）。这是编码开销从 1.54% 升到 ~5.5% 的来源，换来更高效率与前向纠错 (FEC)，降低 PAM4 高误码率下的重传代价。
 
 ### 3.4 Root Complex 架构
 
@@ -2387,6 +2494,55 @@ Credit 管"别溢出"，Tag 管"别对不上号"，谁都替代不了谁：
 
 > **一句话总结：** DMA 的延迟与吞吐由"翻译 (IOTLB/ATS) + 一致性 (snoop/DDIO) + 流控 (credit/tag) + TLP 效率 (MPS/对齐/partial) + 放置 (LLC/TPH/NUMA)"五段共同决定，任何一段成为短板都会拖住整体；写路径是 posted 无回执、靠描述符 + 中断收尾，读路径靠 tag 支撑并发。
 
+### 3.12 DDIO：IO 数据直接放置
+
+**DDIO (Data Direct I/O)** 决定"入站 DMA 落在哪"（§3.11 提及，本节展开配置）：让**入站 DMA 读/写直接分配进 LLC**，CPU 随后消费数据时命中 L3 而非掉到 DRAM。这是网卡/DPDK 场景低延迟的基础。
+
+**机制与默认行为：**
+- 入站写：DDIO 默认把写分配进 LLC 的**有限几个 way**（不是整个 LLC），防止 IO 数据把 CPU 工作集挤掉；
+- 入站读：数据若已在 LLC 则直接命中返回；
+- way 数量由 **IIO LLC WAYS 寄存器**控制（平台相关，访问方式见 uncore 手册）。增大 ways 增加 DDIO 可用的 LLC 容量、提高命中率，但过多会反过来污染 CPU 缓存。
+
+**与 DPDK/网卡的关系：**
+- DPDK 收包路径希望报文落在 LLC，CPU 一读就命中 L3——DDIO 命中率直接影响收包延迟；
+- 若 DDIO 被关、或 way 太少导致数据被驱逐，报文数据掉到 DRAM，延迟从 ~50 周期量级跳到 ~200+ 周期。
+
+**测量 DDIO 命中：** 用 uncore PMU 观察入站 IO 访问对 LLC 的命中/未命中（IIO/CHA 相关事件，见 §14.4）；Intel 也提供专门的 DDIO 性能监控方法（配合 pcm-iio / VTune 的 DDIO 分析）。
+
+**调优建议：**
+- **延迟敏感（收包处理）：** 确保 DDIO 开启、way 数合适，让报文落 LLC；
+- **带宽敏感的大缓冲流式：** DDIO 收益有限、还可能污染缓存，可放宽；
+- 调 IIO LLC WAYS 时观察 PCIe 读写命中率与吞吐的前后变化。
+
+> **与 TPH 的关系：** DDIO 决定"要不要分配进 LLC"，TPH（§3.11）进一步决定"放到哪个切片/核附近"，两者配合优化 IO 数据放置。
+
+### 3.13 PCIe 链路训练与电源管理
+
+**链路训练与 LTSSM：** PCIe 链路建立要经过 **LTSSM (Link Training and Status State Machine)**，从 Detect → Polling → Configuration → L0 完成速率/宽度协商、lane 对齐与均衡。§21.2 的链路降级（降速/降宽）常是链路没能训练到预期状态：
+
+| 常见 LTSSM 问题 | 表现 | 排查 |
+|----------------|------|------|
+| 训练卡在 Polling/Recovery | 链路不稳、反复重训 | 信号完整性、retimer |
+| 均衡 (EQ) 失败 | 只能训到低速 | Gen3+ 的 TX/RX preset、retimer |
+| lane 反转/极性反转未纠正 | 部分 lane 不可用、宽度降 | 板级布线 |
+
+- **均衡 (EQ)：** Gen3 及以上训练时需做 TX/RX 均衡（preset），EQ 不合适会退回低速。
+- **看链路状态：** `lspci -vvv` 对比 `LnkCap`（能力）与 `LnkSta`（实际）——速率/宽度不一致即降级。
+
+**电源管理（ASPM 与 L 态）：** PCIe 链路有多个电源状态（L 态）：
+
+| 状态 | 含义 | 退出延迟 |
+|------|------|---------|
+| **L0** | 活跃 | 正常 |
+| **L0s** | 快速恢复低功耗（单向） | 小 |
+| **L1** | 较深低功耗（双向） | 较大（μs 级） |
+| **L2/L3** | 深睡/关断 | 需重新初始化 |
+
+- **ASPM (Active State Power Management)：** 链路空闲时自动进 L0s/L1 省电；**退出 L1 需要链路恢复，引入 μs 级延迟**——对延迟敏感的 IO（网卡、NVMe）通常关闭 ASPM。
+- **取舍：** ASPM 省电但抬高 IO 延迟；性能场景一般在 BIOS 关闭，省电场景才开。
+
+> **实战提示：** IO 延迟抖动大或长尾明显时，先查 ASPM 是否开启、链路是否频繁进出 L1；关闭 ASPM 后对比延迟变化。
+
 ---
 
 ## 第4章 IOMMU (Intel VT-d)
@@ -2474,6 +2630,27 @@ Root Table
 | SNP | Snoop 位 — 是否发出一致性事务 |
 | TM | Transient Mapping 提示 |
 | 地址 | 下一级页表或翻译后物理帧的地址 |
+
+#### 两级翻译（虚拟化直通场景）
+
+虚拟化直通时，设备发出的 DMA 地址要经过**两级翻译**：
+
+```
+设备 DMA 地址 (GVA)
+   │ 第一级 (first-level): GVA → GPA  (guest 页表, 类似 EPT)
+   ▼
+Guest 物理地址 (GPA)
+   │ 第二级 (second-level): GPA → HPA  (host IOMMU 页表)
+   ▼
+Host 物理地址 (HPA)
+```
+
+- **第一级翻译：** 用 guest 的页表（对应 CPU 侧的 EPT），把 guest 虚拟地址翻成 guest 物理地址；
+- **第二级翻译：** host 的 IOMMU 页表把 GPA 翻成真实 HPA；
+- Scalable 模式下，PASID Table Entry 可分别指向 first-level、second-level 或嵌套 (nested) 页表；
+- 嵌套（两级）遍历级数更多、未命中代价更高，IOTLB / 页表遍历缓存因此格外重要。
+
+> **与 CPU 侧的对应：** 设备的两级翻译对应 CPU 在虚拟机下的"EPT + host 页表"两级翻译，都是为了解决"guest 地址 → host 物理地址"，一个走 IOMMU、一个走 MMU。
 
 ### 4.4 IOTLB 性能影响
 
@@ -2587,6 +2764,25 @@ PASID 使每个设备支持多个独立地址空间：
 - 无需 pin 页面或预映射 DMA 缓冲区
 - 页缺失时通过 PRI (Page Request Interface) 实现 I/O 按需分页
 
+**SVA 深化——按需分页与 PRI：**
+
+SVA (Shared Virtual Addressing) 让设备直接用进程的虚拟地址做 DMA，关键是处理"页还不在内存"的情况：
+
+```
+设备 DMA 某 GVA → IOMMU 翻译发现缺页 (present=0)
+  → 设备经 PRI 发 Page Request (带 PASID + 地址)
+  → OS/hypervisor 处理缺页 (分配物理页、建立映射、可能从 swap 换入)
+  → OS 回复 Page Response, 并失效相关 IOTLB/ATC
+  → 设备重试该 DMA → 翻译成功
+```
+
+- **PRI (Page Request Interface)：** 设备向 OS 发起缺页请求的通道，是 I/O 按需分页的基础；
+- **与 CPU 缺页的对应：** CPU 访存缺页由 MMU 触发、OS 处理；设备 DMA 缺页由 IOMMU + PRI 触发、同样由 OS 处理，机制对称；
+- **价值：** 支持设备访问可换页 (pageable) 内存、惰性分配，不必预先 pin 全部缓冲——对大缓冲、统一内存 (如 GPU/加速器) 场景意义重大；
+- **代价：** 缺页路径长（涉及 OS），首次访问延迟高，热路径应尽量命中已建立映射。
+
+> **PASID 的角色：** PASID 是 SVA 的"多路复用器"——一个物理设备靠不同 PASID 同时服务多个进程的地址空间（每进程一个 PASID），这也是 §3.10 SR-IOV 之外另一种设备虚拟化/共享手段。
+
 ### 4.7 ATS (Address Translation Services)
 
 ```
@@ -2678,6 +2874,20 @@ PEBS 精确采样:
 - `MEM_INST_RETIRED.*` — 精确加载/存储事件
 - `BR_MISP_RETIRED.ALL_BRANCHES` — 精确误预测分支
 - `FRONTEND_RETIRED.*` (ICL+) — 精确前端受限事件
+
+**Adaptive PEBS (Skylake+) 详解：**
+- 传统 PEBS 记录格式固定、字段全带，记录大；
+- Adaptive PEBS 把记录分成"基本组 + 扩展组"，软件选择包含哪些组（基本组必选，可选组有 GPR、内存信息、LBR、时间戳等）；
+- 好处：记录更小 → 同一缓冲容纳更多记录 → 采样开销更低、可用更高采样率。
+
+**PEBS via PT (Processor Trace)：**
+- PMU v5（见 §5.1）起，PEBS 记录可经 **Processor Trace** 通道输出，而非直接写内存；
+- PT 本身是记录指令执行流（instruction trace）的特性，PEBS 搭 PT 的"车"，能把精确事件与指令流按时间关联；
+- 适合需要还原"某事件前后发生了什么"的场景。
+
+**内存延迟采样实战：**
+- `perf mem record -t load` 利用 PEBS load latency 事件（`MEM_LOAD_RETIRED.*` + 延迟），记录每个采样 load 的数据地址与延迟；
+- `perf mem report --sort=mem` 按内存层级（L1/L2/L3/DRAM/远端）聚合，直接给出延迟分布——这是测"核心视角 Load-to-Use 延迟"的标准手段（见 §12.2）。
 
 ### 5.5 LBR (Last Branch Record)
 
@@ -2942,6 +3152,41 @@ I/O 一致性:              IRP
 | **MMIO** | 内存映射 I/O | ICX+ iMC PMON |
 | **TPMI** | 新接口 | Xeon 6 (GNR/SRF) 电源管理 |
 
+### 5.9 RDT 资源监控 (CMT/MBM)
+
+**RDT (Resource Director Technology)** 是独立于 PMU 的资源监控/分配机制，关注"共享资源（LLC、内存带宽）被谁用了多少"。PCM 可集成 RDT 指标（见附录 C 的 `PCM_USE_RESCTRL`）。
+
+**RDT 功能模块：**
+
+| 模块 | 全称 | 作用 |
+|------|------|------|
+| **CMT** | Cache Monitoring Technology | 监控进程/VM 的 LLC 占用 |
+| **MBM** | Memory Bandwidth Monitoring | 监控进程/VM 的内存带宽 |
+| **CAT** | Cache Allocation Technology | 分配 LLC way（隔离） |
+| **MBA** | Memory Bandwidth Allocation | 限制内存带宽 |
+
+CMT/MBM 是**监控**，CAT/MBA 是**分配/隔离**。
+
+**监控原理：**
+- 硬件给每个进程/VM 分配 **RMID (Resource Monitoring ID)**，缓存行/内存访问被打上 RMID 标签；
+- CMT 按 RMID 统计 LLC 占用，MBM 按 RMID 统计内存带宽；
+- 能力枚举经 CPUID leaf 0xF（监控）与 0x10（分配）。
+
+**使用：**
+```bash
+# 内核 resctrl 文件系统 (需 CONFIG_X86_CPU_RESCTRL)
+mount -t resctrl resctrl /sys/fs/resctrl
+mkdir /sys/fs/resctrl/mon_groups/g1
+echo <pid> > /sys/fs/resctrl/mon_groups/g1/tasks
+cat /sys/fs/resctrl/mon_groups/g1/mon_data/mon_L3_00/llc_occupancy
+cat /sys/fs/resctrl/mon_groups/g1/mon_data/mon_L3_00/mbm_total_bytes
+
+# 或用 Intel intel-cmt-cat 工具 (pqos)
+pqos -m "all:[0-3]"     # 监控核 0-3 的 LLC 占用
+```
+
+**与 PCM 的配合：** PMU 回答"发生了多少事件"（定位瓶颈），RDT 回答"某进程占了多少 LLC/带宽"（资源归属）。两者结合适合多租户/虚拟化的 noisy neighbor 定位——PCM 看到 LLC 命中率掉、带宽涨，RDT 进一步指出是哪个进程在挤占。
+
 ---
 
 ## 第6章 Top-Down 微架构分析方法 (TMAM)
@@ -3050,6 +3295,58 @@ $ pcm 1
  READ : Memory Read Bandwidth (GB/s)
  WRITE: Memory Write Bandwidth (GB/s)
 ```
+
+### 6.6 TMAM Level 3 细分
+
+Level 1/2 定位"大类"，真正指导优化要下到 Level 3。下面是各 L1/L2 类别的 L3 细分（精确系数随代次变化，取精确值用 `perf stat --topdown` / pmu-tools `toplev` / VTune）。
+
+**Frontend Bound：**
+
+| L3 | 含义 | 关键事件 |
+|----|------|---------|
+| **Fetch Latency** | ITLB miss / ICache miss / 分支重引导导致取指停顿 | `FRONTEND_RETIRED.*` (ICL+)、`ITLB_MISSES`、`ICACHE_MISSES` |
+| **Fetch Bandwidth** | 供给带宽不足 (MITE 路径、DSB 切换) | `IDQ_UOPS_NOT_DELIVERED.*`、`IDQ.MITE_UOPS` vs `IDQ.DSB_UOPS` |
+
+**Bad Speculation：**
+
+| L3 | 含义 | 关键事件 |
+|----|------|---------|
+| **Branch Mispredict** | 分支误预测浪费的槽位 ≈ 误预测数 × 惩罚 / SLOTS | `BR_MISP_RETIRED.ALL_BRANCHES` |
+| **Machine Clears** | 内存序/FP assist 等清除浪费的槽位 | `MACHINE_CLEARS.COUNT`、`MACHINE_CLEARS.MEMORY_ORDERING` |
+
+**Backend Bound → Memory Bound：**
+
+| L3 | 含义 | 关键事件 |
+|----|------|---------|
+| **L1 Bound** | load 命中 L1 的停顿（延迟短但次数多） | `MEM_LOAD_RETIRED.L1_HIT` |
+| **L2 Bound** | load 命中 L2 的停顿 | `MEM_LOAD_RETIRED.L2_HIT` |
+| **L3 Bound** | load 命中 L3 的停顿 | `MEM_LOAD_RETIRED.L3_HIT` |
+| **DRAM Bound** | load miss 到 DRAM（延迟）或带宽饱和 | `MEM_LOAD_RETIRED.L3_MISS`、`UNC_M_CAS_COUNT`（带宽） |
+| **Store Bound** | store 相关停顿（SB 满、转发失败） | `MEM_INST_RETIRED.*STORES`、`RESOURCE_STALLS.SB` |
+
+**Backend Bound → Core Bound：**
+
+| L3 | 含义 | 关键事件 |
+|----|------|---------|
+| **Divider** | 除法器端口忙 | `ARITH.DIVIDER_ACTIVE` |
+| **Ports Utilization** | 端口压力 / 执行资源利用不足 | `UOPS_EXECUTED.THREAD`、`UOPS_DISPATCHED_PORT.*` |
+
+**公式的一般形式：** L3 指标本质是估算"停在该层的槽位占比"：
+```
+X_Bound ≈ (导致停顿的事件数 × 平均延迟) / Total_Slots
+Total_Slots = N × CPU_CLK_UNHALTED.THREAD   (N = 流水线宽度, §6.2)
+```
+例如 DRAM Bound ≈ `MEM_LOAD_RETIRED.L3_MISS` × DRAM 延迟 / Total_Slots；Branch Mispredict ≈ `BR_MISP_RETIRED.ALL_BRANCHES` × 误预测惩罚 / Total_Slots。
+
+**使用方法：**
+```bash
+# perf 直接给多级 topdown (推荐)
+perf stat --topdown -a sleep 1
+# pmu-tools toplev (最完整, 可下钻 L3+)
+python3 toplev.py -l3 --core C0 ./my_app
+```
+
+> **L3 解读注意：** L3 子项可能有重叠（PMU 同时统计），加总可能超过父类；分析时先在 L2 定方向，再用 L3 定位具体原因。DRAM Bound 还要进一步区分"延迟受限"（L3_MISS 多、带宽未饱和）与"带宽受限"（带宽接近峰值，见 §20.2）。
 
 ---
 
@@ -3653,6 +3950,16 @@ Core Power License 2: 0.00%
 - License 1 主导 → 用 AVX2 Turbo 上限
 - License 2 主导 → 用 AVX-512 Turbo 上限
 
+**AVX-512 与 AMX 的扩展：**
+
+- **AVX-512 降频是"功率授权"而非 bug：** 512-bit 运算瞬时功耗高，硬件自动降频以不超功率预算。降幅因代次/平台而异（客户端降得多、服务器降得少）。
+- **AMX (Advanced Matrix Extensions, SPR+)：** 矩阵加速指令（TMUL），功耗更高，重 AMX 负载会进入更深的频率档位。
+- **对性能分析的影响：**
+  - 比较向量化收益时要同时看频率下降——AVX-512 单周期吞吐高但频率低，净收益需实测；
+  - 用 `pcm-power` 的 Core Power License 占比判断当前处于哪个档位（§13.5）；
+  - 有些负载"用 AVX2 保频率"比"用 AVX-512 但降频"更快。
+- **E-core 注意：** E-core（Sierra Forest、客户端混合架构的小核）不支持 AVX-512，没有 License 2 档位。
+
 #### 13.5.2 Core 频率参考值获取
 
 ```bash
@@ -3757,6 +4064,88 @@ echo "THERM_STATUS = 0x$THERM"
 ```
 
 > **核心提示：** `pcm-power` 自身不直接告诉你"是否降频"，需要你做对比。Uncore 中等档位频率 (如 2.2 GHz) 在非满负载时通常是 PCU 主动节能调节的结果，对延迟敏感型负载可考虑锁定到最大频率。
+
+### 13.6 CPU 功耗与频率管理原理
+
+§13.5 讲"如何检测降频"，本节讲背后的**机制与控制**：频率怎么被决定、thermal 怎么实现、何时降频、如何拉满并阻止降频、指令如何影响频率。
+
+#### 13.6.1 频率如何被决定：P-state、Turbo 与决策单元
+
+- **P-state (Performance State)：** 一组离散的频率/电压对 (V/F 曲线)，P0 最高。CPU 在 P-state 间切换以匹配负载。
+- **决策单元是 PCU (Power Control Unit，§5.7.2)：** 综合**负载、功率预算 (RAPL PL1/PL2)、热裕量、电流上限**决定当前频率。
+- **Turbo Boost：** 有功率/热裕量且活跃核少时，频率可升到 base 之上。每"活跃核数"对应一个 Turbo 上限（`MSR_TURBO_RATIO_LIMIT` 0x1AD，见 §13.5.2）——**活跃核越多，单核可达 Turbo 越低**。
+- **HWP / Speed Shift (Skylake+)：** 硬件自主调频（毫秒级快速切换），OS 只给倾向性提示。关键 MSR：
+  - `IA32_HWP_CAPABILITIES` (0x771)：硬件能力（最高/最低/保证性能）；
+  - `IA32_HWP_REQUEST` (0x774)：OS 的请求，含 **EPP (Energy Performance Preference)** 字段 [31:24]，0=最激进性能、255=最省电。
+  - Linux 由 `intel_pstate` 驱动管理（governor：performance / powersave）。
+- **Uncore (Ring/Mesh) 频率独立调节**（§13.4），与核心频率分开。
+
+#### 13.6.2 Thermal 实现细节
+
+- **DTS (Digital Thermal Sensor)：** 每核一个温度传感器，读出的是**距 Tj_max 的余量**，不是绝对温度。
+- **Tj_max (最大结温)：** 服务器通常 ~100°C；接近它时触发保护。
+- **温度 MSR：** `IA32_THERM_STATUS` (0x19C，每核) / `IA32_PACKAGE_THERM_STATUS` (0x1B1，整封装)，`turbostat` 的 CoreTmp 即源于此（§13.5.5）。
+- **PROCHOT (Processor Hot)：** 热保护信号，达到阈值触发降频（可被外部 VRM/平台拉动）。
+- **热节流 (thermal throttling)：** 温度超阈值时硬件自动降频降温，状态位记录在 `IA32_THERM_STATUS`（§13.5.5 的 bit 0 Thermal / bit 10 PROCHOT）。
+
+#### 13.6.3 何时会降频（降频原因分类）
+
+| 原因 | 触发条件 | 检测 |
+|------|---------|------|
+| **热节流** | 温度接近 Tj_max | 0x19C/0x1B1 thermal 位、CoreTmp |
+| **功率限制** | 超 RAPL PL1/PL2 | PkgWatt vs TDP、0x610 |
+| **电流限制** | 超 IccMax/EDP | 0x19C bit 14 |
+| **指令档位** | AVX2/AVX-512/AMX 重负载 | Core Power License (§13.5.1) |
+| **活跃核多** | Turbo 预算按核数摊薄 | 0x1AD 各档 |
+| **低负载节能** | PCU 主动降频省电 | FREQ/AFREQ 低但无节流 |
+| **BIOS 配置** | 节能模式/功率上限 | BIOS 电源选项 |
+
+诊断命令见 §13.5.5（turbostat + 节流 MSR + RAPL）。
+
+#### 13.6.4 如何让 CPU 最大频率运行 / 阻止降频
+
+先明确"最大频率"的含义：**base 频率**是 TDP 内保证值；**Turbo** 高于 base，取决于活跃核数与功率/热裕量。"拉满"= 消除所有限制，让 CPU 维持当前核数/指令集允许的最高 Turbo。
+
+```bash
+# 1. 调速器设为 performance (避免低负载降频)
+cpupower frequency-set -g performance
+# 或: echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# 2. HWP: EPP 设为最激进 (0)
+x86_energy_perf_policy performance      # 或 wrmsr -a 0x774 把 EPP 字段置 0
+
+# 3. 放宽 RAPL 功率限制 (避免功率节流)
+#    经 powercap sysfs 或 wrmsr 0x610 提高 PL1/PL2, 或 BIOS 解锁功率上限
+cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw
+
+# 4. 限制深度 C-state (降低唤醒延迟, 保持核心活跃; 代价是功耗)
+#    内核参数: intel_idle.max_cstate=1  (极端低延迟可用 idle=poll)
+
+# 5. 锁定 Uncore 频率 (§13.4)
+echo <kHz> | tee /sys/devices/system/cpu/intel_uncore_frequency/*/max_freq_khz
+```
+
+**硬件/BIOS 侧：**
+- 散热足够（不触发热节流）——这是"持续满 Turbo"的前提；
+- BIOS 选"Maximum Performance"电源策略，关闭节能模式；
+- 理解上限：全核满 Turbo < 单核满 Turbo；AVX 负载下频率按档位降（§13.6.5）。
+
+> **注意：** 拉满频率 = 牺牲功耗与散热裕量换性能。性能测试时要这样做以消除变量（§13.4 锁 Uncore 同理），但生产环境需权衡功耗/温度。
+
+#### 13.6.5 指令对频率的影响
+
+不同指令位宽/类型的瞬时功耗不同，硬件按"功率授权"给不同频率档（§13.5.1 的 Core Power License）：
+
+| 指令类别 | License | 频率 |
+|---------|---------|------|
+| 标量 / 轻量 | 0 | 最高（base + 全 Turbo） |
+| AVX2 (256-bit) 重负载 | 1 | 中（AVX2 offset，约 -200~400 MHz） |
+| AVX-512 重负载 | 2 | 最低（AVX-512 offset，约 -400~800 MHz） |
+| AMX (SPR+) 重负载 | 更深档 | 更低 |
+
+- **机制：** 宽向量/矩阵单元开关功耗高，硬件自动降频以不超功率预算；进入/退出 AVX-512 代码段有频率切换（license 切换）延迟。
+- **分析含义：** 比较向量化收益必须同时看频率下降——AVX-512 单周期吞吐高但频率低，净收益需实测；有些负载"用 AVX2 保频率"反而更快。
+- **监控：** 用 `pcm-power` 的 Core Power License 占比判断当前档位（§13.5.1）；E-core 无 AVX-512，无 License 2。
 
 ---
 
@@ -4069,6 +4458,40 @@ sudo pcm-raw \
 ```
 
 > **关键提示：** Intel Uncore 事件命名约定有细微的代次差异，`_1` 后缀的精确含义 (Mesh 接口/VC/周期) 在不同平台 (SPR vs EMR vs GNR) 可能略有不同。**最权威的来源是 Intel perfmon JSON 中该事件的 `BriefDescription` / `PublicDescription` 字段**。
+
+### 14.5 perf 与 PCM：对比与配合
+
+PCM 和 Linux `perf` 都是 PMU 前端，二者互补而非替代：
+
+| 维度 | PCM | perf |
+|------|-----|------|
+| 定位 | 系统级实时监控、开箱即用指标 | 灵活事件采样/计数、逐进程 |
+| 强项 | 聚合指标 (IPC/带宽/TMAM L1)、Uncore 带宽 | 精确归因 (PEBS/LBR)、调用栈、逐进程 |
+| 典型问题 | "全系统内存带宽多少""IPC 低不低" | "哪行代码在 miss""哪个分支误预测" |
+| 输出 | 实时表格 / CSV / Prometheus | perf.data (report/annotate) |
+
+**分工（典型流程）：**
+1. 用 `pcm` / `pcm-memory` **定方向**（是 CPU/内存/IO 哪一类问题）；
+2. 用 `perf record` + PEBS/LBR **定代码**（哪个函数/哪行/哪个分支）；
+3. 回到 `pcm` **验证修复效果**。
+
+**两个实战 perf 工具：**
+
+**`perf mem`——内存访问层级与延迟（基于 PEBS load latency）：**
+```bash
+perf mem record -t load ./my_app       # 采样 load, 记录地址+延迟
+perf mem report --sort=mem             # 按 L1/L2/L3/DRAM/远端聚合
+```
+直接给出"核心视角 Load-to-Use 延迟"与各层未命中分布（见 §12.2），比手读 `MEM_LOAD_RETIRED` 直观。
+
+**`perf c2c`——假共享定位：**
+```bash
+perf c2c record -g ./my_app            # 采样带 HITM 的 load
+perf c2c report                        # 按缓存行聚合, 定位假共享
+```
+专治假共享（§20.5）：把 HITM（读到别的核改过的行）的 load 按地址聚合，直接指出哪条缓存行、哪个变量被多核争抢。
+
+**共存注意：** PCM 与 perf 抢同一组硬件计数器，同时跑会冲突或计数器多路复用（见 FAQ Q4）。常规做法是分时——先 PCM 看全局，再 perf 下钻；确需并发时用 `PCM_NO_MSR=1` 让 PCM 走 perf_event 后端减少冲突。
 
 ---
 
@@ -4846,7 +5269,7 @@ PCM_PRINT_TOPOLOGY=1 sudo pcm 1 -i=1
 
 ---
 
-> **手册版本：** v3.13 (全文正确性评审：修正 §2.8 IIO/IO tile 小节将 SPR/EMR 误标为单 die——实为 SPR 4-tile、EMR 2-tile MCM，仅 SKX/ICX 单 die；交叉引用与其余事实表核验无误)
+> **手册版本：** v3.15 (新增 §13.6 CPU 功耗与频率管理原理：频率决定机制 P-state/Turbo/HWP、thermal 实现 DTS/Tj_max/PROCHOT、降频原因分类、拉满频率与防降频方法、指令对频率的影响)
 > **最后更新：** 2026-11-09
 > **基于 PCM 版本：** 202604+
 > **参考资料：**
